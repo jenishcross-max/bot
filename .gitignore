@@ -1,0 +1,5 @@
+node_modules/
+auth_info/
+.env
+*.log
+auth_info.b64.txt

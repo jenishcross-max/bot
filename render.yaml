@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: whatsapp-ai-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: SYSTEM_PROMPT
+        value: Ты — дружелюбный ассистент по трудоустройству в WhatsApp. Отвечай кратко и по делу на русском языке.
+      - key: AUTH_INFO_B64
+        sync: false
