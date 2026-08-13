@@ -11,9 +11,18 @@ if (!fs.existsSync(AUTH_DIR)) {
   process.exit(1);
 }
 
-const filenames = fs.readdirSync(AUTH_DIR).filter((f) => f.endsWith('.json'));
-if (filenames.length === 0) {
-  console.error(`В папке "${AUTH_DIR}" нет файлов сессии. Сначала войдите по QR-коду.`);
+// Папка auth_info разрастается до тысяч файлов (pre-key, lid-mapping, session-*),
+// но для входа нужны только ключи аккаунта — остальное Baileys восстановит сам.
+// Иначе base64-строка вырастает до сотен килобайт и не влезает в переменную окружения.
+// app-state-sync-version-* тоже не берём: это состояние синхронизации чатов, оно
+// весит под сотню килобайт и пересоздаётся при первом подключении.
+const ESSENTIAL = /^(creds\.json|app-state-sync-key-.*\.json)$/;
+
+const all = fs.readdirSync(AUTH_DIR).filter((f) => f.endsWith('.json'));
+const filenames = process.env.PACK_ALL === 'true' ? all : all.filter((f) => ESSENTIAL.test(f));
+
+if (!filenames.includes('creds.json')) {
+  console.error(`В папке "${AUTH_DIR}" нет creds.json. Сначала войдите по QR-коду ("npm run start:whatsapp").`);
   process.exit(1);
 }
 
