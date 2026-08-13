@@ -41,6 +41,18 @@ services:
       # --- Магазин ---
       - key: SHOP_MODE
         value: "true"
+      - key: CURRENCY
+        value: сом
+
+      # --- Режим «Торгаш»: бот торгуется с юмором, но цену не снижает ---
+      - key: HAGGLE_MODE
+        value: "false"
+      - key: HAGGLE_BADGES
+        value: "true"
+      - key: HAGGLE_NOTIFY_ROUND
+        value: "4"
+      - key: HAGGLE_BONUS
+        sync: false
       - key: SHOP_NAME
         sync: false
       - key: SHOP_ADDRESS

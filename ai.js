@@ -1,5 +1,6 @@
 const Groq = require('groq-sdk');
 const { notifyAdmins } = require('./notify');
+const haggle = require('./haggle');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
@@ -13,6 +14,8 @@ const SHOP_ADDRESS = process.env.SHOP_ADDRESS || '';
 const SHOP_PHONE = process.env.SHOP_PHONE || '';
 const SHOP_HOURS = process.env.SHOP_HOURS || '';
 const SHOP_DELIVERY = process.env.SHOP_DELIVERY || '';
+// Валюта в ответах клиентам. Меняется одной переменной — «тенге», «руб» и т.д.
+const CURRENCY = process.env.CURRENCY || 'сом';
 
 const DEFAULT_SHOP_PROMPT =
   `Ты — вежливый продавец-консультант магазина «${SHOP_NAME}», отвечаешь клиентам в WhatsApp. ` +
@@ -79,7 +82,7 @@ function formatProductsContext(products) {
   }
   return products
     .map((p) => {
-      const price = p.price != null ? `${p.price} тенге` : 'цена не указана';
+      const price = p.price != null ? `${p.price} ${CURRENCY}` : 'цена не указана';
       const stock = typeof p.quantity === 'number' ? `, в наличии: ${p.quantity} шт.` : '';
       return `- ${p.name}: ${price}${p.category ? ` [${p.category}]` : ''}${p.description ? ` — ${p.description}` : ''}${stock}`;
     })
@@ -117,6 +120,10 @@ async function getAIReply(chatId, userMessage) {
     return handleManagerRequest(chatId, userMessage, history);
   }
 
+  // Проверку на менеджера оставляем выше: «беру, оформляйте» после торга — это
+  // заявка, и владелец должен получить её, а не очередную шутку про ценник.
+  const haggling = haggle.detect(chatId, userMessage);
+
   const systemMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
   if (SHOP_MODE) {
@@ -136,19 +143,44 @@ async function getAIReply(chatId, userMessage) {
     }
   }
 
+  // Персона торгаша идёт последней системной инструкцией: поставленная раньше,
+  // она проигрывает промпту каталога («отвечай кратко и по делу»), и вместо шутки
+  // клиент получает сухое «цену снизить не могу».
+  if (haggling) systemMessages.push({ role: 'system', content: haggling.prompt });
+
   const messages = [
     ...systemMessages,
     ...history.slice(-MAX_HISTORY_MESSAGES),
   ];
 
-  const completion = await groq.chat.completions.create({
-    model: MODEL,
-    messages,
-    temperature: 0.7,
-    max_tokens: 800,
-  });
+  let completion;
+  try {
+    completion = await groq.chat.completions.create({
+      model: MODEL,
+      messages,
+      // Торгашу нужна отсебятина: на 0.7 шутки быстро начинают повторяться.
+      temperature: haggling ? 0.95 : 0.7,
+      max_tokens: 800,
+    });
+  } catch (err) {
+    // В торге молчание хуже заготовки: клиент ждёт ответной шутки, а не тишины.
+    if (!haggling) throw err;
+    console.error('Groq недоступен, отвечаю заготовкой торгаша:', err.message);
+    const canned = haggle.fallback(haggling);
+    history.push({ role: 'assistant', content: canned });
+    return canned + haggle.badge(haggling);
+  }
 
-  const reply = completion.choices[0]?.message?.content?.trim() || 'Извините, не смог сформировать ответ.';
+  let reply = completion.choices[0]?.message?.content?.trim() || 'Извините, не смог сформировать ответ.';
+
+  if (haggling) {
+    // Последний рубеж: что бы модель ни насочиняла, скидка до клиента не доедет.
+    reply = haggle.guard(reply, haggling);
+    history.push({ role: 'assistant', content: reply });
+    // Игровую строчку в историю не кладём — модели она только мешает.
+    return reply + haggle.badge(haggling);
+  }
+
   history.push({ role: 'assistant', content: reply });
 
   return reply;
@@ -156,6 +188,7 @@ async function getAIReply(chatId, userMessage) {
 
 function resetHistory(chatId) {
   conversations.delete(chatId);
+  haggle.reset(chatId);
 }
 
 module.exports = { getAIReply, resetHistory };
