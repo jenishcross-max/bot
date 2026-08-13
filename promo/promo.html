@@ -1,0 +1,827 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Промо-ролик — WhatsApp-бот для бизнеса</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* Фон страницы = цвет краёв сцены: если окно не ровно 9:16, поля по бокам
+     не видно на записи. */
+  html, body { height: 100%; background: #070b12; overflow: hidden; }
+
+  /* Сцена всегда 1080x1920 (вертикаль для Reels/Stories), а на экран её
+     ужимает transform: scale — так вёрстка не зависит от размера окна. */
+  #fit { position: fixed; inset: 0; overflow: hidden; }
+  #stage {
+    width: 1080px; height: 1920px; position: absolute; left: 50%; top: 50%; overflow: hidden;
+    transform-origin: center center;
+    background: radial-gradient(120% 75% at 50% 0%, #17304a 0%, #0c1626 55%, #070b12 100%);
+    color: #eef4fb;
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  #stage::after {
+    content: ''; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(60% 40% at 50% 45%, rgba(37,211,102,.16), transparent 70%);
+  }
+
+  /* --- Плашка ниши сверху --- */
+  .tag {
+    position: absolute; top: 92px; left: 50%; transform: translateX(-50%);
+    padding: 18px 40px; border-radius: 999px; z-index: 5;
+    background: rgba(255,255,255,.08); border: 2px solid rgba(255,255,255,.16);
+    font-size: 34px; font-weight: 600; letter-spacing: .5px; white-space: nowrap;
+    opacity: 0; transition: opacity .35s ease;
+  }
+  .tag.show { opacity: 1; }
+
+  /* --- Телефон --- */
+  .phone {
+    position: absolute; top: 210px; left: 50%; transform: translateX(-50%);
+    width: 730px; height: 1330px; z-index: 4;
+    border-radius: 62px; border: 12px solid #1b2733; overflow: hidden;
+    background: #efeae2;
+    box-shadow: 0 50px 120px rgba(0,0,0,.6), 0 0 0 2px rgba(255,255,255,.06);
+    opacity: 0; transition: opacity .4s ease, transform .4s ease;
+  }
+  .phone.show { opacity: 1; }
+  .phone.tg { background: #cfd9e4; }
+
+  .head {
+    height: 132px; display: flex; align-items: center; gap: 22px; padding: 0 28px;
+    background: #008069; color: #fff;
+  }
+  .phone.tg .head { background: #517da2; }
+  .phone.tg .chat { background: #cfd9e4; }
+  .head .ava {
+    width: 82px; height: 82px; border-radius: 50%; flex: 0 0 auto;
+    background: rgba(255,255,255,.22); display: grid; place-items: center; font-size: 42px;
+  }
+  .head .who { font-size: 36px; font-weight: 600; line-height: 1.2; }
+  .head .st { font-size: 25px; opacity: .85; margin-top: 4px; }
+
+  /* justify-content: flex-end — переписка растёт снизу вверх, как в настоящем чате,
+     а не висит вверху пустого экрана. */
+  .chat {
+    height: calc(100% - 132px); overflow: hidden; padding: 26px 26px 34px;
+    display: flex; flex-direction: column; justify-content: flex-end; gap: 18px;
+    background: #e4ddd4;
+  }
+  .row { display: flex; }
+  .row.in { justify-content: flex-start; }
+  .row.out { justify-content: flex-end; }
+  .bubble {
+    max-width: 80%; padding: 22px 26px; border-radius: 28px; font-size: 33px; line-height: 1.36;
+    color: #10231c; background: #fff; white-space: pre-line;
+    box-shadow: 0 3px 8px rgba(0,0,0,.10);
+    animation: pop .34s cubic-bezier(.2,.9,.3,1.2) both;
+  }
+  .row.in .bubble { border-top-left-radius: 10px; }
+  .row.out .bubble { background: #d9fdd3; border-top-right-radius: 10px; }
+  .phone.tg .row.out .bubble { background: #eeffdd; }
+  .bubble .time { display: block; margin-top: 10px; font-size: 22px; color: #667781; text-align: right; }
+  /* Фото товара от клиента — «снимок» в пузыре, как в настоящей переписке. */
+  .bubble.has-photo { width: 60%; max-width: 60%; }
+  .bubble .photo {
+    height: 330px; margin-bottom: 16px; border-radius: 18px;
+    background: linear-gradient(155deg, #f6f7f9 0%, #dde3ea 100%);
+    display: grid; place-items: center; font-size: 175px; line-height: 1;
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(18px) scale(.96); } to { opacity: 1; transform: none; } }
+
+  .bubble.typing { display: flex; gap: 12px; padding: 30px 30px; }
+  .bubble.typing i {
+    width: 15px; height: 15px; border-radius: 50%; background: #90a4a0;
+    animation: blink 1.1s infinite ease-in-out;
+  }
+  .bubble.typing i:nth-child(2) { animation-delay: .18s; }
+  .bubble.typing i:nth-child(3) { animation-delay: .36s; }
+  @keyframes blink { 0%,80%,100% { opacity: .3; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-6px); } }
+
+  /* --- Уведомление в Telegram владельцу --- */
+  .card {
+    position: absolute; top: 250px; left: 100px; right: 100px; z-index: 8;
+    background: #fff; color: #14202b; border-radius: 30px; padding: 26px 30px;
+    box-shadow: 0 30px 70px rgba(0,0,0,.55);
+    animation: cardIn .45s cubic-bezier(.2,.9,.3,1.2) both;
+  }
+  .card.hide { animation: cardOut .35s ease both; }
+  .card .src { display: flex; align-items: center; gap: 12px; font-size: 26px; color: #517da2; font-weight: 700; margin-bottom: 12px; }
+  .card .txt { font-size: 32px; line-height: 1.35; white-space: pre-line; font-weight: 500; }
+  @keyframes cardIn { from { opacity: 0; transform: translateY(-40px) scale(.95); } to { opacity: 1; transform: none; } }
+  @keyframes cardOut { to { opacity: 0; transform: translateY(-30px) scale(.97); } }
+
+  /* --- Подпись снизу --- */
+  .cap {
+    position: absolute; bottom: 120px; left: 90px; right: 90px; z-index: 5; text-align: center;
+    font-size: 46px; font-weight: 700; line-height: 1.24; letter-spacing: -.5px;
+    text-shadow: 0 6px 30px rgba(0,0,0,.6);
+    opacity: 0; transform: translateY(16px); transition: opacity .4s ease, transform .4s ease;
+  }
+  .cap.show { opacity: 1; transform: none; }
+  .cap b { color: #6ef29a; }
+
+  /* --- Заставка и финал --- */
+  .overlay {
+    position: absolute; inset: 0; z-index: 20; display: grid; place-items: center; text-align: center;
+    padding: 0 90px; opacity: 0; pointer-events: none; transition: opacity .45s ease;
+    background: radial-gradient(90% 60% at 50% 40%, #163b2c 0%, #0b1220 60%, #070b12 100%);
+  }
+  .overlay.show { opacity: 1; }
+  .overlay .wa-mark { font-size: 130px; margin-bottom: 30px; }
+  .overlay h1 { font-size: 96px; line-height: 1.08; font-weight: 800; letter-spacing: -2px; }
+  .overlay h1 span { color: #25d366; }
+  .overlay .sub { margin-top: 34px; font-size: 46px; font-weight: 600; opacity: .85; line-height: 1.3; }
+  .overlay .niches { margin-top: 46px; font-size: 38px; line-height: 1.7; opacity: .8; font-weight: 500; }
+  .overlay .handle {
+    margin-top: 56px; display: inline-block; padding: 22px 52px; border-radius: 999px;
+    background: #25d366; color: #06281a; font-size: 46px; font-weight: 800;
+  }
+  .fadein > * { animation: up .6s cubic-bezier(.2,.9,.3,1) both; }
+  .fadein > *:nth-child(2) { animation-delay: .16s; }
+  .fadein > *:nth-child(3) { animation-delay: .30s; }
+  .fadein > *:nth-child(4) { animation-delay: .44s; }
+  .fadein > *:nth-child(5) { animation-delay: .58s; }
+  @keyframes up { from { opacity: 0; transform: translateY(28px); } to { opacity: 1; transform: none; } }
+
+  /* --- Заставка «включить звук» ---
+     Браузер не запускает аудио без клика пользователя, поэтому ролик стартует
+     не сам, а с этой кнопки. */
+  #gate {
+    position: fixed; inset: 0; z-index: 200; display: grid; place-items: center;
+    background: rgba(4,8,14,.95); color: #eef4fb; text-align: center; padding: 24px;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 16px; line-height: 1.5;
+  }
+  #gate.gone { display: none; }
+  #gate .ico { font-size: 62px; }
+  #gate h2 { font-size: 26px; margin: 14px 0 10px; }
+  #gate p { opacity: .7; margin-bottom: 22px; }
+  #gate button {
+    font-family: inherit; font-size: 16px; font-weight: 700; padding: 14px 26px;
+    border-radius: 12px; border: 0; cursor: pointer; margin: 0 6px;
+    background: #25d366; color: #06281a;
+  }
+  #gate button.ghost { background: rgba(255,255,255,.12); color: #cdd8e6; font-weight: 500; }
+  #gate .warn { margin: 22px auto 0; font-size: 13px; color: #9fb0c4; max-width: 520px; line-height: 1.6; }
+  #gate .warn b { color: #ffcf6b; font-weight: 600; }
+
+  /* --- Панель управления (в запись не попадает: прячется клавишей H или ?clean=1) --- */
+  #ui {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 100;
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center;
+    max-width: calc(100vw - 24px);
+    background: rgba(12,18,28,.9); border: 1px solid rgba(255,255,255,.14); border-radius: 14px;
+    padding: 10px 14px; color: #cdd8e6; font: 500 14px/1 -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #ui.hidden { display: none; }
+  #ui button {
+    font: inherit; padding: 8px 14px; border-radius: 9px; cursor: pointer;
+    background: #25d366; color: #06281a; border: 0; font-weight: 700;
+  }
+  #ui button.ghost { background: rgba(255,255,255,.1); color: #cdd8e6; }
+  #ui button.off { opacity: .4; text-decoration: line-through; }
+  #ui .dur { opacity: .75; }
+
+  /* --- Шпаргалка с текстом озвучки и таймингами (для записи своего голоса) --- */
+  #script {
+    position: fixed; top: 16px; right: 16px; bottom: 90px; width: 420px; z-index: 110;
+    overflow-y: auto; padding: 20px 22px; border-radius: 16px;
+    background: rgba(10,16,24,.96); border: 1px solid rgba(255,255,255,.14); color: #dbe4ef;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 14px; line-height: 1.55;
+  }
+  #script.hidden { display: none; }
+  #script h3 { font-size: 16px; margin-bottom: 6px; }
+  #script .note { font-size: 13px; color: #93a4b8; margin-bottom: 16px; }
+  #script li { list-style: none; margin-bottom: 14px; display: flex; gap: 12px; }
+  #script .tc {
+    flex: 0 0 auto; font-variant-numeric: tabular-nums; font-weight: 700; color: #25d366;
+    background: rgba(37,211,102,.12); border-radius: 7px; padding: 3px 8px; height: fit-content;
+  }
+</style>
+</head>
+<body>
+  <div id="fit">
+    <div id="stage">
+      <div id="tag" class="tag"></div>
+      <div id="phone" class="phone">
+        <div id="head" class="head"></div>
+        <div id="chat" class="chat"></div>
+      </div>
+      <div id="cap" class="cap"></div>
+      <div id="cards"></div>
+      <div id="overlay" class="overlay"></div>
+    </div>
+  </div>
+
+  <div id="gate">
+    <div>
+      <div class="ico">🔊</div>
+      <h2>Промо-ролик со звуком</h2>
+      <p>Ролик зациклен — записывать удобно со второго круга.</p>
+      <button id="goMusic">▶ Музыка и звуки</button>
+      <button id="goVoice" class="ghost">＋ синтезированная озвучка</button>
+      <button id="goMute" class="ghost">Без звука</button>
+      <div class="warn" id="gateWarn"></div>
+    </div>
+  </div>
+
+  <div id="script" class="hidden"></div>
+
+  <div id="ui">
+    <button id="replay">↻ Сначала</button>
+    <button id="mus" class="ghost">🎵 Музыка (M)</button>
+    <button id="voi" class="ghost">🎙 Синтез (V)</button>
+    <button id="vload" class="ghost">🎧 Свой голос</button>
+    <button id="scr" class="ghost">📋 Текст (T)</button>
+    <button id="hide" class="ghost">Скрыть (H)</button>
+    <span class="dur" id="dur"></span>
+    <input id="vfile" type="file" accept="audio/*" hidden>
+  </div>
+
+<script>
+/* ------------------------------------------------------------------
+   Что менять под себя: только CONFIG и SCENES ниже.
+   Ролик вертикальный 1080x1920 — под Reels, Stories и TikTok.
+------------------------------------------------------------------- */
+const CONFIG = {
+  handle: '@ваш_ник',                 // ваш ник в Instagram / Telegram
+  cta: 'Подключу вашему бизнесу за 1 день',
+};
+
+const SCENES = [
+  {
+    type: 'intro',
+    dur: 3800,
+    mark: '💬',
+    h1: 'Ваш WhatsApp<br><span>отвечает сам</span>',
+    sub: 'Клиент пишет ночью — ответ через 2 секунды',
+    // vo — текст озвучки. Читается вслух при старте сцены, на экране не показывается.
+    // Названия пишем «как слышится»: синтез речи читает латиницу невнятно.
+    vo: 'Ваш Вотсап отвечает клиентам сам. Даже ночью.',
+  },
+  {
+    type: 'chat', app: 'wa',
+    tag: '🔩 Строймаркет',
+    ava: '🧑', who: 'Клиент', st: '+996 555 ***  ·  02:14',
+    cap: 'Цены и остатки — <b>из вашей базы</b>, бот ничего не выдумывает',
+    vo: 'Клиент спрашивает про товар — бот берёт цену и остаток из вашей базы и сразу откладывает заказ.',
+    msgs: [
+      { s: 'in',  t: 'монтажная пена есть? почём' },
+      { s: 'out', t: 'Есть 🙂 Makroflex 750 мл — 420 сом, на складе 14 баллонов.\nПистолет для пены — 850 сом. Отложить?', typing: 1500 },
+      { s: 'in',  t: 'давай 3 баллона' },
+      { s: 'out', t: 'Отложил 3 баллона, итого 1260 сом.\nЗаберёте сегодня до 19:00?', typing: 1300 },
+    ],
+  },
+  {
+    type: 'chat', app: 'wa',
+    tag: '👕 Магазин одежды',
+    ava: '👩', who: 'Клиент', st: '+996 700 ***  ·  в сети',
+    cap: 'Клиент прислал фото — бот <b>узнал модель и назвал размеры</b>',
+    vo: 'Прислали фото — бот узнаёт модель, называет размеры и бронирует. А вам приходит уведомление.',
+    msgs: [
+      { s: 'in',  img: '👕', t: 'есть такая футболка? размер L' },
+      { s: 'out', t: 'Да! Оверсайз, белая — 990 сом.\nL и XL в наличии, есть ещё чёрная и бежевая.\nОтложить L?', typing: 1700 },
+      { s: 'in',  t: 'да, отложите' },
+      { s: 'out', t: 'Отложила до завтра 🙌\nАдрес: ул. Киевская 95, примерить можно на месте.', typing: 1300 },
+      { s: 'card', t: '🔔 Новая бронь\nФутболка оверсайз, L · 990 сом\nКлиент: +996 700 ***', dur: 2500 },
+    ],
+  },
+  {
+    type: 'chat', app: 'wa',
+    tag: '📱 Электроника',
+    ava: '🧔', who: 'Клиент', st: '+996 777 ***  ·  в сети',
+    cap: 'Знает <b>наличие, комплектации и сроки заказа</b>',
+    vo: 'Знает наличие, комплектации и сроки заказа.',
+    msgs: [
+      { s: 'in',  t: 'айфон 17 про макс есть в наличии?' },
+      { s: 'out', t: 'iPhone 17 Pro Max 256 ГБ — 129 900 сом, есть чёрный и титан.\n512 ГБ — 149 900 сом, под заказ 3 дня.\nКакой смотрим?', typing: 1700 },
+    ],
+  },
+  {
+    type: 'chat', app: 'wa',
+    tag: '🙋 Хочет живого человека',
+    ava: '🧑', who: 'Клиент', st: '+996 555 ***  ·  в сети',
+    cap: 'Сложный вопрос — бот <b>честно передаёт заявку вам</b>',
+    vo: 'Сложный вопрос — бот честно передаёт заявку вам.',
+    msgs: [
+      { s: 'in',  t: 'а можно с менеджером поговорить?' },
+      { s: 'out', t: 'Конечно! Передал вашу заявку менеджеру — он свяжется в течение 10 минут.\nТелефон: +996 555 000-000', typing: 1300 },
+      { s: 'card', t: '🔔 Клиент просит менеджера\n+996 555 *** · «можно с менеджером поговорить?»', dur: 2500 },
+    ],
+  },
+  {
+    type: 'chat', app: 'tg',
+    tag: '⚙️ Вы — из Telegram',
+    ava: '🤖', who: 'Бот-админка', st: 'управление товарами',
+    cap: 'Весь прайс — <b>одним сообщением</b>. Можно голосом или фото накладной',
+    vo: 'Товары загружаете одним сообщением, прямо из Телеграма.',
+    msgs: [
+      { s: 'out', t: 'Пена Makroflex 750; 420; 14\nПистолет для пены; 850; 6\nПерчатки рабочие; 90; 100' },
+      { s: 'in',  t: 'Готово:\n🆕 Пена Makroflex 750 — 420 сом, 14 шт.\n🆕 Пистолет для пены — 850 сом, 6 шт.\n🆕 Перчатки рабочие — 90 сом, 100 шт.', typing: 1500 },
+    ],
+  },
+  {
+    type: 'cta',
+    dur: 5200,
+    mark: '🟢',
+    h1: CONFIG.cta,
+    sub: 'Работает на вашем номере WhatsApp.\nБез приложений и сайтов.',
+    niches: 'строймаркеты · одежда · электроника<br>салоны красоты · автосервисы · доставка<br>цветы · аптеки · мебель',
+    handle: CONFIG.handle,
+    vo: 'Подключу вашему бизнесу за один день. Напишите мне.',
+  },
+];
+
+/* ---------------- звук ----------------
+   Музыка и эффекты синтезируются прямо в браузере (Web Audio API): в проекте нет
+   ни одного mp3, поэтому и вопроса с правами на музыку в рекламе не возникает.
+   Озвучка — системный синтез речи (Web Speech API), голос берётся из Windows.
+------------------------------------------------------------------- */
+const AUDIO = (() => {
+  const BPM = 84;
+  const STEP = 60 / BPM / 2;                     // длительность восьмой, сек
+  // Am - F - C - G: спокойная светлая последовательность, не спорит с голосом.
+  const CHORDS = [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]];
+  const ARP = [0, 1, 2, 1, 0, 2, 1, 2];
+  const hz = (n) => 440 * Math.pow(2, (n - 69) / 12);
+
+  let ctx = null, musicBus = null, sfxBus = null, noiseBuf = null;
+  let sched = null, step = 0, nextT = 0;
+  let musicOn = true, voiceOn = false, voice = null;
+  let track = null;   // своя озвучка одним файлом на весь ролик
+
+  /* --- примитивы --- */
+  function tone(type, f, t, dur, peak, bus, glideTo) {
+    const o = ctx.createOscillator();
+    o.type = type;
+    o.frequency.setValueAtTime(f, t);
+    if (glideTo) o.frequency.exponentialRampToValueAtTime(glideTo, t + dur * 0.7);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(bus || musicBus);
+    o.start(t); o.stop(t + dur + 0.05);
+  }
+
+  function noiseSrc() {
+    if (!noiseBuf) {
+      noiseBuf = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 1.2), ctx.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const s = ctx.createBufferSource();
+    s.buffer = noiseBuf;
+    return s;
+  }
+
+  function hat(t, peak) {
+    const s = noiseSrc();
+    const f = ctx.createBiquadFilter();
+    f.type = 'highpass'; f.frequency.value = 8500;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(peak, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+    s.connect(f); f.connect(g); g.connect(musicBus);
+    s.start(t); s.stop(t + 0.07);
+  }
+
+  function kick(t) {
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(115, t);
+    o.frequency.exponentialRampToValueAtTime(42, t + 0.11);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.75, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+    o.connect(g); g.connect(musicBus);
+    o.start(t); o.stop(t + 0.28);
+  }
+
+  // Пад держится весь такт: три расстроенных пилы через мягкий фильтр.
+  function pad(chord, t, dur) {
+    const f = ctx.createBiquadFilter();
+    f.type = 'lowpass'; f.frequency.value = 850; f.Q.value = 0.7;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.13, t + 0.7);
+    g.gain.setValueAtTime(0.13, t + dur - 0.45);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    f.connect(g); g.connect(musicBus);
+    for (let i = 0; i < chord.length; i++) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = hz(chord[i]);
+      o.detune.value = (i - 1) * 7;
+      o.connect(f);
+      o.start(t); o.stop(t + dur + 0.1);
+    }
+  }
+
+  // Планировщик с большим запасом (1.5 с): если вкладка уходит в фон и таймеры
+  // тормозятся до 1 с, музыка всё равно не рвётся.
+  function tick() {
+    const ahead = ctx.currentTime + 1.5;
+    while (nextT < ahead) {
+      const s = step % 8;
+      const chord = CHORDS[Math.floor(step / 8) % CHORDS.length];
+      if (s === 0) pad(chord, nextT, STEP * 8);
+      if (s === 0 || s === 4) { kick(nextT); tone('sine', hz(chord[0] - 24), nextT, 0.45, 0.30); }
+      hat(nextT, s % 2 ? 0.045 : 0.08);
+      tone('triangle', hz(chord[ARP[s]] + 12), nextT, 0.30, 0.085);
+      nextT += STEP; step++;
+    }
+  }
+
+  function startMusic() {
+    if (sched) return;
+    step = 0;
+    nextT = ctx.currentTime + 0.15;
+    tick();
+    sched = setInterval(tick, 250);
+  }
+
+  function stopMusic() {
+    clearInterval(sched); sched = null;
+    musicBus.gain.cancelScheduledValues(ctx.currentTime);
+    musicBus.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.15);
+  }
+
+  /* --- голос --- */
+  // Предпочитаем нейросетевые голоса Edge («Natural»/«Online») — они звучат живо,
+  // обычные SAPI-голоса Windows заметно роботизированнее.
+  function pickVoice() {
+    if (!window.speechSynthesis) return null;
+    const all = speechSynthesis.getVoices().filter((v) => /^ru/i.test(v.lang));
+    return all.find((v) => /natural|online/i.test(v.name)) || all[0] || null;
+  }
+  if (window.speechSynthesis) {
+    voice = pickVoice();
+    speechSynthesis.onvoiceschanged = () => { voice = pickVoice(); };
+  }
+
+  function duck(on) {
+    if (!ctx || !sched) return;
+    musicBus.gain.setTargetAtTime(on ? 0.30 : 1, ctx.currentTime, 0.25);
+  }
+
+  return {
+    hasVoice: () => !!voice,
+    // Нейросетевой голос («Natural»/«Online») звучит заметно живее обычного SAPI.
+    hasGoodVoice: () => !!voice && /natural|online/i.test(voice.name),
+    voiceName: () => (voice ? voice.name : ''),
+    isMusicOn: () => musicOn,
+    isVoiceOn: () => voiceOn,
+
+    hasTrack: () => !!track,
+
+    // Свой голос: один файл на весь ролик, стартует вместе с первой сценой.
+    // Синтез при этом выключаем — два голоса одновременно не нужны.
+    setTrack(url) {
+      if (track) track.pause();
+      track = new Audio(url);
+      track.preload = 'auto';
+      track.onplay = () => duck(true);
+      track.onended = track.onpause = () => duck(false);
+      voiceOn = false;
+      if (window.speechSynthesis) speechSynthesis.cancel();
+    },
+
+    playTrack() {
+      if (!track) return;
+      try { track.currentTime = 0; } catch (e) { /* файл ещё не догрузился */ }
+      track.play().catch(() => {});
+    },
+
+    stopTrack() { if (track) track.pause(); },
+
+    init(sound, tts) {
+      musicOn = !!sound;
+      voiceOn = !!tts;
+      if (!sound || ctx) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) { musicOn = voiceOn = false; return; }
+      ctx = new AC();
+      musicBus = ctx.createGain(); musicBus.gain.value = 1;
+      sfxBus = ctx.createGain(); sfxBus.gain.value = 1;
+      const master = ctx.createGain(); master.gain.value = 0.34;
+      musicBus.connect(master); sfxBus.connect(master); master.connect(ctx.destination);
+      startMusic();
+    },
+
+    toggleMusic() {
+      musicOn = !musicOn;
+      if (!ctx) return musicOn;
+      if (musicOn) { musicBus.gain.setValueAtTime(1, ctx.currentTime); startMusic(); }
+      else stopMusic();
+      return musicOn;
+    },
+
+    toggleVoice() {
+      voiceOn = !voiceOn;
+      if (voiceOn && track) track.pause();   // либо свой голос, либо синтез
+      if (!voiceOn) this.stopVoice();
+      return voiceOn;
+    },
+
+    // Короткие звуки переписки: входящее — две ноты вверх, исходящее — мягкий «пуф».
+    sfx(kind) {
+      if (!ctx || !musicOn) return;
+      const t = ctx.currentTime;
+      if (kind === 'in') { tone('sine', 700, t, 0.13, 0.5, sfxBus); tone('sine', 1050, t + 0.09, 0.2, 0.42, sfxBus); }
+      if (kind === 'out') { tone('sine', 520, t, 0.1, 0.34, sfxBus); tone('sine', 700, t + 0.06, 0.16, 0.26, sfxBus); }
+      if (kind === 'card') {
+        [1046, 1568, 2093].forEach((f, i) => tone('sine', f, t + i * 0.02, 0.9 - i * 0.2, 0.34 - i * 0.09, sfxBus));
+      }
+      if (kind === 'scene') {                 // короткий «вжух» на смене сцены
+        const s = noiseSrc();
+        const f = ctx.createBiquadFilter();
+        f.type = 'bandpass'; f.Q.value = 1.1;
+        f.frequency.setValueAtTime(400, t);
+        f.frequency.exponentialRampToValueAtTime(3200, t + 0.34);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.22, t + 0.12);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.4);
+        s.connect(f); f.connect(g); g.connect(sfxBus);
+        s.start(t); s.stop(t + 0.42);
+      }
+    },
+
+    say(text) {
+      if (!voiceOn || !text || !window.speechSynthesis) return;
+      // cancel() сразу перед speak() иногда «съедает» реплику в Chrome —
+      // поэтому отменяем предыдущую и говорим следующим тиком.
+      speechSynthesis.cancel();
+      setTimeout(() => {
+        if (!voiceOn) return;
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'ru-RU';
+        u.rate = 1.04;
+        u.pitch = 1;
+        if (voice) u.voice = voice;
+        u.onstart = () => duck(true);
+        u.onend = u.onerror = () => duck(false);
+        speechSynthesis.speak(u);
+      }, 70);
+    },
+
+    stopVoice() {
+      if (window.speechSynthesis) speechSynthesis.cancel();
+      duck(false);
+    },
+  };
+})();
+
+/* ---------------- движок ---------------- */
+const stage = document.getElementById('stage');
+const phone = document.getElementById('phone');
+const head  = document.getElementById('head');
+const chat  = document.getElementById('chat');
+const tagEl = document.getElementById('tag');
+const capEl = document.getElementById('cap');
+const cards = document.getElementById('cards');
+const over  = document.getElementById('overlay');
+
+function fit() {
+  // Центрируем через translate, а не grid: grid прижимает элемент к краю,
+  // когда он больше контейнера, и сцена уезжает за экран.
+  const s = Math.min(window.innerWidth / 1080, window.innerHeight / 1920);
+  stage.style.transform = 'translate(-50%, -50%) scale(' + s + ')';
+}
+window.addEventListener('resize', fit);
+fit();
+
+let timers = [];
+const at = (fn, t) => timers.push(setTimeout(fn, t));
+const clearAll = () => { timers.forEach(clearTimeout); timers = []; };
+
+// Пауза после сообщения — длинное читают дольше, иначе ролик обгоняет зрителя.
+const readTime = (t) => Math.min(1700, 550 + t.length * 20);
+
+function el(cls, html) {
+  const e = document.createElement('div');
+  if (cls) e.className = cls;
+  if (html != null) e.innerHTML = html;
+  return e;
+}
+// «990 сом», «14 шт.», «256 ГБ» — число и единицу переносом строки не разрываем.
+const NB = ' ';
+const esc = (s) => s
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/(\d) (?=сом|шт|ГБ|мл|баллон|мин)/g, '$1' + NB);
+
+function addMsg(m) {
+  const row = el('row ' + (m.s === 'in' ? 'in' : 'out'));
+  // Неразрывный пробел внутри числа: «129 900 сом» не должно переноситься по строкам.
+  const text = m.t.replace(/(\d) (?=\d{3})/g, '$1 ');
+  const photo = m.img ? '<div class="photo">' + m.img + '</div>' : '';
+  const b = el('bubble' + (m.img ? ' has-photo' : ''),
+    photo + esc(text) + '<span class="time">' + clock() + (m.s === 'out' ? ' ✓✓' : '') + '</span>');
+  row.appendChild(b);
+  chat.appendChild(row);
+  chat.scrollTop = chat.scrollHeight;
+  AUDIO.sfx(m.s === 'in' ? 'in' : 'out');
+}
+
+function clock() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+function typing(side, on) {
+  const old = chat.querySelector('.row.typing-row');
+  if (old) old.remove();
+  if (!on) return;
+  const row = el('row ' + side + ' typing-row');
+  row.appendChild(el('bubble typing', '<i></i><i></i><i></i>'));
+  chat.appendChild(row);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function showCard(text) {
+  const c = el('card');
+  c.innerHTML = '<div class="src">✈️ Telegram · вам</div><div class="txt">' + esc(text) + '</div>';
+  cards.appendChild(c);
+  AUDIO.sfx('card');
+  at(() => { c.classList.add('hide'); at(() => c.remove(), 400); }, 2400);
+}
+
+function openScene(sc) {
+  chat.innerHTML = '';
+  phone.className = 'phone ' + (sc.app === 'tg' ? 'tg ' : '') + 'show';
+  head.innerHTML =
+    '<div class="ava">' + sc.ava + '</div>' +
+    '<div><div class="who">' + sc.who + '</div><div class="st">' + sc.st + '</div></div>';
+  tagEl.textContent = sc.tag;
+  tagEl.classList.add('show');
+  capEl.innerHTML = sc.cap;
+  capEl.classList.add('show');
+  AUDIO.sfx('scene');
+}
+
+function closeScene() {
+  phone.classList.remove('show');
+  tagEl.classList.remove('show');
+  capEl.classList.remove('show');
+}
+
+function showOverlay(sc) {
+  const parts = ['<div class="wa-mark">' + sc.mark + '</div>', '<h1>' + sc.h1 + '</h1>'];
+  if (sc.sub) parts.push('<div class="sub">' + sc.sub.replace(/\n/g, '<br>') + '</div>');
+  if (sc.niches) parts.push('<div class="niches">' + sc.niches + '</div>');
+  if (sc.handle) parts.push('<div class="handle">' + sc.handle + '</div>');
+  over.innerHTML = '<div class="fadein">' + parts.join('') + '</div>';
+  over.classList.add('show');
+  AUDIO.sfx('scene');
+}
+
+// dry === true — только считаем длительность, ничего не показываем.
+function runScene(sc, t0, dry) {
+  let t = t0;
+  // Озвучка стартует чуть позже картинки: сначала кадр, потом голос.
+  if (!dry && sc.vo) at(() => AUDIO.say(sc.vo), t + 300);
+  if (sc.type === 'intro' || sc.type === 'cta') {
+    if (!dry) { at(() => showOverlay(sc), t); at(() => over.classList.remove('show'), t + sc.dur - 450); }
+    return t + sc.dur;
+  }
+  if (!dry) at(() => openScene(sc), t);
+  t += 600;
+  for (const m of sc.msgs) {
+    if (m.s === 'card') {
+      if (!dry) at(() => showCard(m.t), t);
+      t += m.dur || 2900;
+      continue;
+    }
+    const side = m.s === 'in' ? 'in' : 'out';
+    if (m.typing) {
+      if (!dry) {
+        const start = t;
+        at(() => typing(side, true), start);
+        at(() => { typing(side, false); addMsg(m); }, start + m.typing);
+      }
+      t += m.typing;
+    }
+    if (!dry && !m.typing) at(() => addMsg(m), t);
+    t += readTime(m.t) + (m.img ? 900 : 0); // фото нужно успеть рассмотреть
+  }
+  t += 700;
+  if (!dry) at(closeScene, t - 450);
+  return t;
+}
+
+function total() {
+  let t = 0;
+  for (const sc of SCENES) t = runScene(sc, t, true);
+  return t + 900;
+}
+
+function play() {
+  clearAll();
+  AUDIO.stopVoice();
+  AUDIO.playTrack();      // своя озвучка стартует вместе с роликом, отсюда и тайминги
+  cards.innerHTML = '';
+  chat.innerHTML = '';
+  closeScene();
+  over.classList.remove('show');
+  let t = 300;
+  for (const sc of SCENES) t = runScene(sc, t, false);
+  at(play, t + 900); // зациклено — удобно и смотреть, и записывать
+}
+
+const ui = document.getElementById('ui');
+const musBtn = document.getElementById('mus');
+const voiBtn = document.getElementById('voi');
+const scrEl = document.getElementById('script');
+document.getElementById('dur').textContent = 'длительность ≈ ' + Math.round(total() / 1000) + ' сек';
+document.getElementById('replay').onclick = play;
+document.getElementById('hide').onclick = () => ui.classList.add('hidden');
+
+function syncBtns() {
+  musBtn.classList.toggle('off', !AUDIO.isMusicOn());
+  voiBtn.classList.toggle('off', !AUDIO.isVoiceOn());
+  document.getElementById('vload').classList.toggle('off', !AUDIO.hasTrack());
+}
+musBtn.onclick = () => { AUDIO.toggleMusic(); syncBtns(); };
+voiBtn.onclick = () => { AUDIO.toggleVoice(); syncBtns(); };
+
+/* --- шпаргалка: когда какую фразу говорить, если начитываете сами --- */
+// Тайминги считаем тем же движком, что и играет ролик, — они не разъедутся.
+function sceneTimes() {
+  const list = [];
+  let t = 300;
+  for (const sc of SCENES) {
+    if (sc.vo) list.push({ ms: t + 300, vo: sc.vo });
+    t = runScene(sc, t, true);
+  }
+  return list;
+}
+
+function mmss(ms) {
+  const s = ms / 1000;
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + s.toFixed(1).padStart(4, '0');
+}
+
+scrEl.innerHTML =
+  '<h3>Текст озвучки</h3>' +
+  '<div class="note">Запишите одним дублем на диктофон под эти тайминги ' +
+  '(отсчёт с момента старта ролика), потом кнопка «🎧 Свой голос» — файл ляжет ' +
+  'ровно в ролик. Пауза между фразами нужна: она попадает на смену сцен.</div>' +
+  '<ul>' + sceneTimes().map((r) =>
+    '<li><span class="tc">' + mmss(r.ms) + '</span><span>' + r.vo + '</span></li>').join('') +
+  '</ul>';
+
+document.getElementById('scr').onclick = () => scrEl.classList.toggle('hidden');
+
+/* --- своя озвучка файлом --- */
+const vfile = document.getElementById('vfile');
+document.getElementById('vload').onclick = () => vfile.click();
+vfile.onchange = () => {
+  const f = vfile.files && vfile.files[0];
+  if (!f) return;
+  AUDIO.setTrack(URL.createObjectURL(f));
+  syncBtns();
+  play();                       // перезапуск, чтобы голос стартовал с начала ролика
+};
+
+addEventListener('keydown', (e) => {
+  if (e.key === 'h' || e.key === 'H') ui.classList.toggle('hidden');
+  if (e.key === 'r' || e.key === 'R') play();
+  if (e.key === 'm' || e.key === 'M') { AUDIO.toggleMusic(); syncBtns(); }
+  if (e.key === 'v' || e.key === 'V') { AUDIO.toggleVoice(); syncBtns(); }
+  if (e.key === 't' || e.key === 'T') scrEl.classList.toggle('hidden');
+});
+if (new URLSearchParams(location.search).get('clean') === '1') ui.classList.add('hidden');
+
+/* --- старт по клику: без действия пользователя браузер не включит звук --- */
+const gate = document.getElementById('gate');
+function start(sound, tts) {
+  AUDIO.init(sound, tts);
+  gate.classList.add('gone');
+  syncBtns();
+  play();
+}
+document.getElementById('goMusic').onclick = () => start(true, false);
+document.getElementById('goVoice').onclick = () => start(true, true);
+document.getElementById('goMute').onclick = () => start(false, false);
+
+// Синтезированная речь для рекламы звучит плохо на любом движке, поэтому по
+// умолчанию она выключена, а на старте честно сказано, какие есть варианты.
+function voiceHint() {
+  const w = document.getElementById('gateWarn');
+  const bad = !AUDIO.hasVoice()
+    ? 'русского голоса в системе нет вообще'
+    : (AUDIO.hasGoodVoice() ? '' : 'в этом браузере доступен только «' + AUDIO.voiceName() + '»');
+  w.innerHTML =
+    '<b>Про озвучку.</b> Синтез речи звучит механически' + (bad ? ' — ' + bad : '') + '. ' +
+    'Для рекламы лучше два варианта:<br>' +
+    '1) <b>начитать самому</b> — кнопка «📋 Текст» покажет фразы с таймингами, ' +
+    'записать на диктофон в телефоне и загрузить кнопкой «🎧 Свой голос»;<br>' +
+    '2) <b>оставить без голоса</b> — подписи на экране всё объясняют, а музыку в Reels ' +
+    'обычно всё равно заменяют на трек из библиотеки Instagram.';
+}
+setTimeout(voiceHint, 400);
+</script>
+</body>
+</html>
