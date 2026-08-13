@@ -8,6 +8,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const pino = require('pino');
 const { getAIReply, resetHistory } = require('./ai');
 const { AUTH_DIR, loadSessionFromEnv } = require('./session-store');
@@ -32,6 +33,9 @@ async function startBot() {
     if (qr) {
       console.log('Отсканируйте QR-код в WhatsApp (Связанные устройства):');
       qrcode.generate(qr, { small: true });
+      QRCode.toFile('qr.png', qr, { width: 400 }).catch((err) => {
+        console.error('Не удалось сохранить QR как PNG:', err);
+      });
     }
 
     if (connection === 'close') {
@@ -86,7 +90,11 @@ async function startBot() {
   });
 }
 
-startBot().catch((err) => {
-  console.error('Не удалось запустить бота:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  startBot().catch((err) => {
+    console.error('Не удалось запустить бота:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { startBot };

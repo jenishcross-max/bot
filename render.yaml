@@ -1,16 +1,58 @@
 services:
-  - type: worker
-    name: whatsapp-ai-bot
+  # WhatsApp-бот и Telegram-админка живут в одном сервисе (server.js): на free-тарифе
+  # Render часы инстансов общие, двух круглосуточных сервисов не хватит.
+  - type: web
+    name: shop-bots
     env: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
+    healthCheckPath: /
     envVars:
+      # --- Groq ---
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_MODEL
         value: llama-3.3-70b-versatile
-      - key: SYSTEM_PROMPT
-        value: Ты — дружелюбный ассистент по трудоустройству в WhatsApp. Отвечай кратко и по делу на русском языке.
+      - key: GROQ_VISION_MODEL
+        value: meta-llama/llama-4-scout-17b-16e-instruct
+      - key: GROQ_AUDIO_MODEL
+        value: whisper-large-v3
+
+      # --- WhatsApp ---
+      # Base64 локальной папки auth_info: node scripts/pack-auth.js
       - key: AUTH_INFO_B64
+        sync: false
+
+      # --- База товаров ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: LOW_STOCK_THRESHOLD
+        value: "5"
+
+      # --- Telegram-админка ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+
+      # --- Магазин ---
+      - key: SHOP_MODE
+        value: "true"
+      - key: SHOP_NAME
+        sync: false
+      - key: SHOP_ADDRESS
+        sync: false
+      - key: SHOP_PHONE
+        sync: false
+      - key: SHOP_HOURS
+        sync: false
+      - key: SHOP_DELIVERY
+        sync: false
+      # Необязательные: если не заданы, бот соберёт тексты сам из данных выше.
+      - key: SHOP_SYSTEM_PROMPT
+        sync: false
+      - key: MANAGER_CONTACT_TEXT
         sync: false
