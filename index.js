@@ -15,6 +15,16 @@ const { AUTH_DIR, loadSessionFromEnv } = require('./session-store');
 
 const logger = pino({ level: 'silent' });
 
+// Текущий QR и состояние связи. Нужны эндпоинту /qr: в логах Render код
+// отсканировать нельзя — вьюер логов растягивает блок-символы по вертикали,
+// и квадраты кода превращаются в прямоугольники. Плюс QR живёт около 20 секунд,
+// так что в ленте логов нужный уже уехал вверх.
+const status = { connection: 'connecting', qr: null, qrAt: 0 };
+
+function getStatus() {
+  return { ...status };
+}
+
 async function startBot() {
   loadSessionFromEnv();
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -31,14 +41,19 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      status.qr = qr;
+      status.qrAt = Date.now();
+      // В локальном терминале код читается нормально, поэтому печатаем как раньше.
       console.log('Отсканируйте QR-код в WhatsApp (Связанные устройства):');
       qrcode.generate(qr, { small: true });
+      console.log('Не получается отсканировать из логов? Откройте /qr у сервиса.');
       QRCode.toFile('qr.png', qr, { width: 400 }).catch((err) => {
         console.error('Не удалось сохранить QR как PNG:', err);
       });
     }
 
     if (connection === 'close') {
+      status.connection = 'close';
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log('Соединение закрыто.', shouldReconnect ? 'Переподключение...' : 'Нужен повторный вход по QR.');
@@ -46,6 +61,9 @@ async function startBot() {
         startBot();
       }
     } else if (connection === 'open') {
+      status.connection = 'open';
+      // QR больше не актуален: держать его в памяти незачем, а отдавать — опасно.
+      status.qr = null;
       console.log('Бот подключен к WhatsApp.');
     }
   });
@@ -97,4 +115,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startBot };
+module.exports = { startBot, getStatus };

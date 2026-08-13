@@ -23,6 +23,10 @@ services:
       # Base64 локальной папки auth_info: node scripts/pack-auth.js
       - key: AUTH_INFO_B64
         sync: false
+      # Пароль к /qr — странице с QR-кодом. Render сгенерирует случайное значение,
+      # посмотреть его можно во вкладке Environment у сервиса.
+      - key: QR_TOKEN
+        generateValue: true
 
       # --- База товаров ---
       - key: SUPABASE_URL
