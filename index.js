@@ -25,6 +25,42 @@ function getStatus() {
   return { ...status };
 }
 
+// «996700000000:0@s.whatsapp.net» -> «996700000000». Номер устройства после
+// двоеточия отрезаем отдельно: иначе он приклеивается к телефону лишней цифрой,
+// и номер получается почти правильный — а такую ошибку глазами не поймать.
+function digitsFromJid(jid) {
+  return String(jid || '').split('@')[0].split(':')[0].replace(/\D/g, '') || null;
+}
+
+// Настоящий телефон клиента. WhatsApp адресует чаты по LID — внутреннему
+// идентификатору вида «123456789012345@lid», номера в нём нет. Владельцу в
+// заявке нужен номер, по которому можно перезвонить, поэтому достаём его из
+// маппинга, который Baileys держит в папке сессии (lid-mapping-*.json).
+async function resolveCustomerPhone(sock, msg, chatId) {
+  // Старая адресация: номер прямо в JID.
+  if (chatId.endsWith('@s.whatsapp.net')) {
+    return digitsFromJid(chatId);
+  }
+
+  // WhatsApp часто кладёт номер рядом с LID прямо в ключ сообщения —
+  // это дешевле, чем лезть в хранилище.
+  const alt = msg.key.remoteJidAlt || msg.key.participantAlt;
+  if (alt && alt.endsWith('@s.whatsapp.net')) {
+    return digitsFromJid(alt);
+  }
+
+  try {
+    const pn = await sock.signalRepository?.lidMapping?.getPNForLID(chatId);
+    if (pn) return digitsFromJid(pn);
+  } catch (err) {
+    console.error('Не удалось определить номер клиента по LID:', err.message);
+  }
+
+  // Номера нет — пусть заявка уйдёт без него. Потерять заявку хуже,
+  // чем отдать её владельцу с пометкой «номер скрыт».
+  return null;
+}
+
 async function startBot() {
   loadSessionFromEnv();
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -97,7 +133,8 @@ async function startBot() {
         await sock.presenceSubscribe(chatId).catch(() => {});
         await sock.sendPresenceUpdate('composing', chatId).catch(() => {});
 
-        const reply = await getAIReply(chatId, text.trim());
+        const phone = await resolveCustomerPhone(sock, msg, chatId);
+        const reply = await getAIReply(chatId, text.trim(), phone);
 
         await sock.sendPresenceUpdate('paused', chatId).catch(() => {});
         await sock.sendMessage(chatId, { text: reply });
@@ -115,4 +152,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startBot, getStatus };
+module.exports = { startBot, getStatus, resolveCustomerPhone, digitsFromJid };

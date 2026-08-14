@@ -106,12 +106,31 @@ function formatProductsContext(products) {
 }
 
 // «77015551234@s.whatsapp.net» -> «+77015551234»
-function formatCustomer(chatId) {
-  const digits = String(chatId || '').split('@')[0].replace(/\D/g, '');
-  return digits ? `+${digits}` : String(chatId || 'неизвестный номер');
+//
+// WhatsApp перешёл на LID-адресацию: вместо номера в чате приходит внутренний
+// идентификатор вида «123456789012345@lid». Раньше здесь просто отрезалось всё
+// до «@» и подставлялся плюс — владелец получал в заявке «+123456789012345»,
+// правдоподобное на вид, но несуществующее число (в телефоне максимум 15 цифр
+// вместе с кодом страны, и такой комбинации не бывает). Позвонить по нему нельзя.
+//
+// Настоящий номер достаёт index.js через маппинг из сессии и передаёт сюда
+// готовым. Если достать не вышло — честно пишем, что номера нет, а не рисуем
+// плюс перед идентификатором.
+function formatCustomer(chatId, phone) {
+  const fromPhone = String(phone || '').replace(/\D/g, '');
+  if (fromPhone) return `+${fromPhone}`;
+
+  const jid = String(chatId || '');
+  if (jid.endsWith('@s.whatsapp.net')) {
+    // split(':') — отрезаем номер устройства, иначе он приклеится к телефону.
+    const digits = jid.split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (digits) return `+${digits}`;
+  }
+
+  return `номер скрыт (напишите клиенту в WhatsApp, id ${jid || 'неизвестен'})`;
 }
 
-function notifyManager(chatId, userMessage, history) {
+function notifyManager(chatId, userMessage, history, phone) {
   const now = Date.now();
   if (now - (lastNotifiedAt.get(chatId) || 0) < NOTIFY_COOLDOWN_MS) return;
   lastNotifiedAt.set(chatId, now);
@@ -123,25 +142,27 @@ function notifyManager(chatId, userMessage, history) {
 
   notifyAdmins(
     `🔔 Клиент просит менеджера!\n\n` +
-      `Номер: ${formatCustomer(chatId)}\n` +
+      `Номер: ${formatCustomer(chatId, phone)}\n` +
       `Сообщение: «${userMessage}»\n\n` +
       `Последние сообщения:\n${recent}`
   ).catch((err) => console.error('Не удалось уведомить владельца:', err));
 }
 
-async function handleManagerRequest(chatId, userMessage, history) {
-  notifyManager(chatId, userMessage, history);
+async function handleManagerRequest(chatId, userMessage, history, phone) {
+  notifyManager(chatId, userMessage, history, phone);
 
   history.push({ role: 'assistant', content: MANAGER_TEXT });
   return MANAGER_TEXT;
 }
 
-async function getAIReply(chatId, userMessage) {
+// phone — настоящий номер клиента, который index.js достаёт из LID-маппинга.
+// В чате его может не быть: WhatsApp адресует по идентификатору, а не по номеру.
+async function getAIReply(chatId, userMessage, phone) {
   const history = getHistory(chatId);
   history.push({ role: 'user', content: userMessage });
 
   if (SHOP_MODE && MANAGER_INTENT.test(userMessage)) {
-    return handleManagerRequest(chatId, userMessage, history);
+    return handleManagerRequest(chatId, userMessage, history, phone);
   }
 
   // Проверку на менеджера оставляем выше: «беру, оформляйте» после торга — это
@@ -206,7 +227,7 @@ async function getAIReply(chatId, userMessage) {
   // даже если вопрос не попал в MANAGER_INTENT. Проверяем после guard: до него
   // текст ответа ещё может измениться.
   if (SHOP_MODE && MANAGER_PROMISE.test(reply)) {
-    notifyManager(chatId, userMessage, history);
+    notifyManager(chatId, userMessage, history, phone);
   }
 
   history.push({ role: 'assistant', content: reply });
