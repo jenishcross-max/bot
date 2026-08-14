@@ -65,6 +65,22 @@ const MANAGER_TEXT = buildManagerText();
 const MANAGER_INTENT =
   /(менеджер|оператор|живой человек|живым человеком|с человеком|консультант|перезвон|позвонит|свяж(и|итесь)|встретит|встреч|подъеха|приеха|заявк|оформить заказ|оставить заказ)/i;
 
+// Обещание передать заявку — уже в ответе бота. Раньше уведомление владельцу
+// висело только на MANAGER_INTENT, а формулировок у клиента больше, чем слов в
+// списке: «беру, оформляйте», «мне нужен человек», «я куплю это» в него не
+// попадали. Такой вопрос уходил в модель, модель по промпту отвечала «передаю
+// заявку менеджеру» — и на этом всё заканчивалось: клиент ждал звонка, владелец
+// о нём не знал. Расширять список слов бессмысленно, их всегда не хватит,
+// поэтому смотрим на то, что бот уже пообещал клиенту.
+const MANAGER_PROMISE =
+  /(переда(ю|л|м|ёт|ет|ю́)?\s+(вашу\s+|вашей\s+)?заявк|заявк\w*\s+менеджеру|менеджеру\s+переда|менеджер\s+свяж|свяжется\s+с\s+вами)/i;
+
+// Не чаще одного уведомления в 10 минут на чат: в длинной переписке модель
+// повторяет обещание почти в каждом ответе, и владелец получит десяток
+// одинаковых сообщений вместо одной заявки.
+const NOTIFY_COOLDOWN_MS = 10 * 60 * 1000;
+const lastNotifiedAt = new Map();
+
 // История диалога на каждый чат: chatId -> [{role, content}, ...]
 const conversations = new Map();
 const MAX_HISTORY_MESSAGES = 20;
@@ -95,7 +111,11 @@ function formatCustomer(chatId) {
   return digits ? `+${digits}` : String(chatId || 'неизвестный номер');
 }
 
-async function handleManagerRequest(chatId, userMessage, history) {
+function notifyManager(chatId, userMessage, history) {
+  const now = Date.now();
+  if (now - (lastNotifiedAt.get(chatId) || 0) < NOTIFY_COOLDOWN_MS) return;
+  lastNotifiedAt.set(chatId, now);
+
   const recent = history
     .slice(-6)
     .map((m) => `${m.role === 'user' ? 'Клиент' : 'Бот'}: ${m.content}`)
@@ -107,6 +127,10 @@ async function handleManagerRequest(chatId, userMessage, history) {
       `Сообщение: «${userMessage}»\n\n` +
       `Последние сообщения:\n${recent}`
   ).catch((err) => console.error('Не удалось уведомить владельца:', err));
+}
+
+async function handleManagerRequest(chatId, userMessage, history) {
+  notifyManager(chatId, userMessage, history);
 
   history.push({ role: 'assistant', content: MANAGER_TEXT });
   return MANAGER_TEXT;
@@ -176,19 +200,25 @@ async function getAIReply(chatId, userMessage) {
   if (haggling) {
     // Последний рубеж: что бы модель ни насочиняла, скидка до клиента не доедет.
     reply = haggle.guard(reply, haggling);
-    history.push({ role: 'assistant', content: reply });
-    // Игровую строчку в историю не кладём — модели она только мешает.
-    return reply + haggle.badge(haggling);
+  }
+
+  // Бот пообещал клиенту передать заявку — значит, владелец обязан её получить,
+  // даже если вопрос не попал в MANAGER_INTENT. Проверяем после guard: до него
+  // текст ответа ещё может измениться.
+  if (SHOP_MODE && MANAGER_PROMISE.test(reply)) {
+    notifyManager(chatId, userMessage, history);
   }
 
   history.push({ role: 'assistant', content: reply });
 
-  return reply;
+  // Игровую строчку в историю не кладём — модели она только мешает.
+  return haggling ? reply + haggle.badge(haggling) : reply;
 }
 
 function resetHistory(chatId) {
   conversations.delete(chatId);
   haggle.reset(chatId);
+  lastNotifiedAt.delete(chatId);
 }
 
 module.exports = { getAIReply, resetHistory };

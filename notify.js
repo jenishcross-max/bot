@@ -6,8 +6,27 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Предупреждаем один раз, а не на каждую заявку: иначе при незаполненных
+// переменных лог забьётся одинаковыми строками.
+let warned = false;
+
 async function notifyAdmins(text) {
-  if (!BOT_TOKEN || ADMIN_IDS.length === 0) return;
+  if (!BOT_TOKEN || ADMIN_IDS.length === 0) {
+    // Раньше здесь был молчаливый return, и заявки просто пропадали: в логах
+    // пусто, клиенту бот отвечает «передал менеджеру», владельцу не приходит
+    // ничего. Понять, что не заполнена переменная, было неоткуда.
+    if (!warned) {
+      warned = true;
+      console.error(
+        'Заявка НЕ отправлена владельцу: не заданы ' +
+          [!BOT_TOKEN && 'TELEGRAM_BOT_TOKEN', ADMIN_IDS.length === 0 && 'ADMIN_TELEGRAM_IDS']
+            .filter(Boolean)
+            .join(' и ') +
+          '. Клиенту при этом бот обещает, что заявка передана.'
+      );
+    }
+    return;
+  }
 
   await Promise.all(
     ADMIN_IDS.map(async (chatId) => {
