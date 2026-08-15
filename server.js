@@ -124,6 +124,24 @@ http
   })
   .listen(PORT, () => console.log(`Health-эндпоинт слушает порт ${PORT}.`));
 
+// Бесплатный тариф Render усыпляет сервис после ~15 минут без входящих запросов.
+// Спящий бот не отвечает в WhatsApp: сообщение клиента сервис не будит, будит только
+// HTTP-запрос. Поэтому раз в 10 минут дёргаем сами себя по внешнему адресу
+// (RENDER_EXTERNAL_URL Render подставляет автоматически).
+// Свой пинг — подстраховка, а не замена внешнему монитору: пока сервис уже уснул,
+// разбудить себя он не может.
+const KEEPALIVE_URL = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+if (KEEPALIVE_URL && process.env.KEEPALIVE !== 'false') {
+  const https = require('https');
+  const client = KEEPALIVE_URL.startsWith('https') ? https : http;
+  setInterval(() => {
+    client
+      .get(KEEPALIVE_URL, (res) => res.resume())
+      .on('error', (err) => console.error('Самопинг не прошёл:', err.message));
+  }, 10 * 60 * 1000).unref();
+  console.log(`Самопинг каждые 10 минут: ${KEEPALIVE_URL}`);
+}
+
 launchAdminBot();
 
 startBot().catch((err) => {

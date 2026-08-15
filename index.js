@@ -5,6 +5,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  downloadMediaMessage,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
@@ -61,6 +62,32 @@ async function resolveCustomerPhone(sock, msg, chatId) {
   return null;
 }
 
+// Картинка из сообщения клиента. WhatsApp хранит медиа зашифрованным на своих
+// серверах, поэтому фото надо именно скачать и расшифровать — в самом сообщении
+// лежит только миниатюра размером с ноготь, распознать по ней нечего.
+async function downloadPhoto(sock, msg) {
+  const image = msg.message.imageMessage;
+  if (!image) return null;
+
+  try {
+    const data = await downloadMediaMessage(msg, 'buffer', {}, {
+      logger,
+      reuploadRequest: sock.updateMediaMessage,
+    });
+    return { data, mimeType: image.mimetype || 'image/jpeg' };
+  } catch (err) {
+    // Фото не скачалось — отвечаем клиенту по подписи, а не молчим.
+    console.error('Не удалось скачать фото клиента:', err.message);
+    return null;
+  }
+}
+
+// Переподключаемся с нарастающей паузой. Повтор без паузы превращается в цикл:
+// WhatsApp видит поток попыток, считает его флудом и рвёт соединение ещё охотнее —
+// со стороны это выглядит как «бот то работает, то нет».
+let reconnectDelay = 1000;
+const RECONNECT_DELAY_MAX = 30000;
+
 async function startBot() {
   loadSessionFromEnv();
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -92,12 +119,20 @@ async function startBot() {
       status.connection = 'close';
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log('Соединение закрыто.', shouldReconnect ? 'Переподключение...' : 'Нужен повторный вход по QR.');
-      if (shouldReconnect) {
-        startBot();
+      const reason = lastDisconnect?.error?.message || 'причина неизвестна';
+      if (!shouldReconnect) {
+        console.log(`Соединение закрыто (код ${statusCode}): ${reason}. Нужен повторный вход по QR — откройте /qr.`);
+        return;
       }
+      const wait = reconnectDelay;
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_DELAY_MAX);
+      console.log(`Соединение закрыто (код ${statusCode}): ${reason}. Переподключаюсь через ${Math.round(wait / 1000)} с.`);
+      setTimeout(() => {
+        startBot().catch((err) => console.error('Переподключение не удалось:', err.message));
+      }, wait);
     } else if (connection === 'open') {
       status.connection = 'open';
+      reconnectDelay = 1000;
       // QR больше не актуален: держать его в памяти незачем, а отдавать — опасно.
       status.qr = null;
       console.log('Бот подключен к WhatsApp.');
@@ -122,7 +157,9 @@ async function startBot() {
           msg.message.imageMessage?.caption ||
           '';
 
-        if (!text.trim()) continue;
+        // Фото без подписи — тоже вопрос: «есть такое?». Раньше такие
+        // сообщения молча пропускались, и клиент оставался без ответа.
+        if (!text.trim() && !msg.message.imageMessage) continue;
 
         if (text.trim().toLowerCase() === '/reset') {
           resetHistory(chatId);
@@ -133,8 +170,11 @@ async function startBot() {
         await sock.presenceSubscribe(chatId).catch(() => {});
         await sock.sendPresenceUpdate('composing', chatId).catch(() => {});
 
-        const phone = await resolveCustomerPhone(sock, msg, chatId);
-        const reply = await getAIReply(chatId, text.trim(), phone);
+        const [phone, photo] = await Promise.all([
+          resolveCustomerPhone(sock, msg, chatId),
+          downloadPhoto(sock, msg),
+        ]);
+        const reply = await getAIReply(chatId, text.trim(), { phone, photo });
 
         await sock.sendPresenceUpdate('paused', chatId).catch(() => {});
         await sock.sendMessage(chatId, { text: reply });
