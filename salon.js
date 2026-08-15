@@ -22,6 +22,11 @@ const MASTERS = (process.env.SALON_MASTERS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
+// За сколько минут до начала окошко перестаёт быть свободным. Предлагать
+// клиенту «через пять минут» бессмысленно: он не успеет доехать, а мастер
+// будет ждать. Полчаса — разумный минимум, меняется переменной.
+const LEAD_MINUTES = Number(process.env.SALON_LEAD_MINUTES || 30);
+
 // Часы работы берём из SALON_HOURS, а если их нет — из общих SHOP_HOURS, где
 // время написано вперемешку с днями недели («Пн-Вс, 09:00-21:00»).
 function parseHours(raw) {
@@ -127,6 +132,115 @@ function formatWhen(date, now = new Date()) {
   return `${p.day} ${MONTHS[p.month - 1]} в ${formatTime(date)}`;
 }
 
+// «сегодня» / «завтра» / «суббота, 22 августа» — заголовок списка окошек.
+function dayLabel(date, now = new Date()) {
+  if (sameLocalDay(date, now)) return 'сегодня';
+  if (sameLocalDay(date, new Date(now.getTime() + 24 * 60 * 60 * 1000))) return 'завтра';
+  const p = localParts(date);
+  return `${WEEKDAYS[p.weekday]}, ${p.day} ${MONTHS[p.month - 1]}`;
+}
+
+function addDays(date, days) {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+const WEEKDAY_PATTERNS = [
+  [/воскресень/i, 0],
+  [/понедельник/i, 1],
+  [/вторник/i, 2],
+  [/сред[ауеы]/i, 3],
+  [/четверг/i, 4],
+  [/пятниц/i, 5],
+  [/суббот/i, 6],
+];
+
+// День из фразы клиента, без обращения к модели.
+//
+// Нужен для вопроса о свободном времени: часа там нет, и модель на «есть окошки
+// завтра?» устойчиво возвращает пустую дату — день для неё не выглядит частью
+// записи. В итоге на вопрос про завтра бот показывал сегодняшнее расписание.
+// Такие слова разбираются кодом надёжнее, чем моделью.
+function dayFromText(text, now = new Date()) {
+  const s = String(text || '');
+  // «послезавтра» проверяем первым: внутри него есть «завтра».
+  if (/послезавтра/i.test(s)) return addDays(now, 2);
+  if (/завтра/i.test(s)) return addDays(now, 1);
+  if (/сегодня/i.test(s)) return now;
+
+  for (const [re, weekday] of WEEKDAY_PATTERNS) {
+    if (!re.test(s)) continue;
+    // Ближайший такой день недели, считая сегодняшний.
+    return addDays(now, (weekday - localParts(now).weekday + 7) % 7);
+  }
+  return null;
+}
+
+/* ---------------- свободные окошки ----------------
+   Клиент спрашивает «а когда у вас свободно?» чаще, чем называет время сам.
+   Раньше на такой вопрос отвечала модель — то есть выдумывала часы, которых
+   никто не проверял. Считаем их из расписания: сетка рабочего дня минус то,
+   что уже занято. */
+
+// Сетка времени салона на конкретный день: 09:00, 10:00, ... до закрытия.
+// Последнее окошко должно успеть закончиться до закрытия, поэтому и «+ шаг».
+function daySlots(day) {
+  const p = localParts(day);
+  const out = [];
+  for (let m = WORK_HOURS.open; m + SLOT_MINUTES <= WORK_HOURS.close; m += SLOT_MINUTES) {
+    const iso = `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
+    const at = localIsoToDate(iso);
+    if (at) out.push(at);
+  }
+  return out;
+}
+
+// Занятость конкретного момента. busy — активные записи этого дня из базы.
+// Возвращает { free, masters, taken }: можно ли записать, кто свободен и какие
+// записи мешают (последнее нужно владельцу — ему важно имя, а не только факт).
+//
+// Мастера могут быть не заведены вовсе (SALON_MASTERS пуст) — тогда кресло одно
+// и любая запись занимает время целиком. Если мастера есть, занятым считается
+// не время, а конкретный мастер: салон в четыре руки работает параллельно, и
+// «занято» для всего салона отдало бы второму клиенту отказ на пустом месте.
+function availabilityAt(when, busy = [], { masters = MASTERS } = {}) {
+  const windowMs = SLOT_MINUTES * 60 * 1000;
+  const at = new Date(when).getTime();
+  const taken = busy.filter((a) => Math.abs(new Date(a.starts_at).getTime() - at) < windowMs);
+
+  if (masters.length === 0) {
+    return { free: taken.length === 0, masters: [], taken };
+  }
+
+  const busyNames = new Set(taken.map((a) => a.master).filter(Boolean));
+  let free = masters.filter((m) => !busyNames.has(m));
+  // Запись без мастера («просто подстригите») занимает любое свободное кресло:
+  // остаток уменьшает, но не говорит, чьё именно кресло занято.
+  const floating = taken.filter((a) => !a.master).length;
+  if (floating > 0) free = free.slice(0, Math.max(0, free.length - floating));
+
+  return { free: free.length > 0, masters: free, taken };
+}
+
+// Свободное время дня — та же проверка, прогнанная по сетке рабочего дня.
+function freeSlots(day, busy = [], { now = new Date(), masters = MASTERS } = {}) {
+  const notBefore = now.getTime() + LEAD_MINUTES * 60 * 1000;
+
+  return daySlots(day)
+    .filter((at) => at.getTime() >= notBefore)
+    .map((at) => ({ at, ...availabilityAt(at, busy, { masters }) }))
+    .filter((s) => s.free);
+}
+
+// Строки списка. Мастера подписываем только там, где свободны не все:
+// «11:00 — Динара, Айгуль» рядом с «11:00» ничего не добавляет, а читать мешает.
+function slotLines(slots, { masters = MASTERS, limit = 8 } = {}) {
+  return slots.slice(0, limit).map((s) => {
+    const time = formatTime(s.at);
+    if (masters.length === 0 || s.masters.length === masters.length) return time;
+    return `${time} — ${s.masters.join(', ')}`;
+  });
+}
+
 /* ---------------- проверка времени записи ---------------- */
 
 const MAX_AHEAD_DAYS = 120;
@@ -162,10 +276,20 @@ function workHoursText() {
 // Дешёвый фильтр перед обращением к модели: гонять каждое «сколько стоит стрижка»
 // через второй запрос к ИИ незачем — это лишняя секунда ожидания и лишние токены.
 const BOOKING_INTENT =
-  /(запиш|записа|запис|свободн|окошк|окно|во сколько|можно (на|в|к)|приду|подойду|подъеду|отмен|перенес|перезапиш|во сколько|время есть|есть время)/i;
+  /(запиш|записа|запис|свободн|окошк|окно|во сколько|когда можно|когда удобно|можно (на|в|к)|приду|подойду|подъеду|отмен|перенес|перезапиш|время есть|есть время|есть места|места есть)/i;
+
+// Дни недели и «завтра». Клиент часто не пишет слова «записаться» вовсе:
+// «а можно завтра в три к Динаре?» — это запись, но ни одного слова из
+// BOOKING_INTENT здесь нет. Раньше такое сообщение уходило обычному ассистенту,
+// и тот радостно отвечал «запишем вас на 15:00» — не проверив, свободно ли оно,
+// и ничего не записав. Лучше лишний раз спросить разборщик, чем пообещать
+// клиенту время, которое уже занято.
+const DAY_WORDS =
+  /(сегодня|завтра|послезавтра|понедельник|вторник|сред[ауеы]|четверг|пятниц|суббот|воскресень|выходн|на неделе|числа)/i;
 
 function looksLikeBooking(text) {
-  return BOOKING_INTENT.test(String(text || ''));
+  const s = String(text || '');
+  return BOOKING_INTENT.test(s) || DAY_WORDS.test(s) || mentionsTime(s);
 }
 
 const MONTH_WORDS =
@@ -194,7 +318,7 @@ const BOOKING_SYSTEM_PROMPT = `Ты разбираешь сообщения кл
 Твоя задача — понять, хочет ли клиент записаться, отменить запись или узнать о своей записи.
 
 Верни ТОЛЬКО JSON без пояснений:
-{"intent": "book" | "cancel" | "check" | "none",
+{"intent": "book" | "cancel" | "check" | "slots" | "none",
  "client_name": "имя клиента или null",
  "service": "название услуги или null",
  "master": "имя мастера или null",
@@ -202,13 +326,17 @@ const BOOKING_SYSTEM_PROMPT = `Ты разбираешь сообщения кл
  "note": "важное уточнение клиента или null"}
 
 Правила:
-- "book" — клиент хочет записаться или перенести запись на новое время.
+- "book" — клиент называет время и хочет записаться или перенести запись.
+- "slots" — клиент спрашивает, какое время свободно, не называя часа:
+  «есть окошки сегодня?», «когда можно?», «во сколько свободно завтра?», «что есть на субботу?».
+  Если клиент назвал конкретный час («можно в три?») — это "book", а не "slots".
 - "cancel" — клиент отменяет запись.
 - "check" — клиент спрашивает, когда он записан.
 - "none" — всё остальное (цены, вопросы об услугах, приветствие).
 - datetime считай относительно текущего времени, указанного ниже, и возвращай без часового пояса.
 - "завтра в 3" в салоне означает 15:00, а не 03:00. Время до 8 утра клиент почти никогда не имеет в виду.
-- Если клиент назвал день без времени ("в субботу") — datetime оставь null.
+- Если клиент назвал только день, без часа ("в субботу", "завтра") — верни этот день с временем 00:00.
+  Час за клиента не придумывай: полночь здесь означает "день известен, время нет".
 - Если время названо без дня ("в 15:00") — считай ближайший день, когда это время ещё не прошло.
 - Имя бери только если клиент его действительно назвал. Не придумывай.
 - Услугу и мастера указывай ТОЧНО так, как они называются в списках ниже, если сообщение им соответствует.`;
@@ -279,7 +407,7 @@ async function parseBookingRequest(text, { services = [], history = [], now = ne
   const timed = at && mentionsTime(text);
 
   return {
-    intent: ['book', 'cancel', 'check'].includes(parsed.intent) ? parsed.intent : 'none',
+    intent: ['book', 'cancel', 'check', 'slots'].includes(parsed.intent) ? parsed.intent : 'none',
     clientName: parsed.client_name ? String(parsed.client_name).trim().slice(0, 60) : null,
     service: parsed.service ? String(parsed.service).trim().slice(0, 80) : null,
     master: master || null,
@@ -293,6 +421,7 @@ module.exports = {
   TIMEZONE,
   MASTERS,
   SLOT_MINUTES,
+  LEAD_MINUTES,
   WORK_HOURS,
   workHoursText,
   localParts,
@@ -300,9 +429,16 @@ module.exports = {
   localIsoToDate,
   localDayRange,
   sameLocalDay,
+  addDays,
+  dayFromText,
   formatTime,
   formatDay,
   formatWhen,
+  dayLabel,
+  daySlots,
+  availabilityAt,
+  freeSlots,
+  slotLines,
   checkWhen,
   looksLikeBooking,
   parseBookingRequest,

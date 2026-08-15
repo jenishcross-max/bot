@@ -11,10 +11,14 @@ const http = require('http');
 const crypto = require('crypto');
 const QRCode = require('qrcode');
 const { startBot, getStatus } = require('./index');
-const { launchAdminBot } = require('./telegram-admin-bot');
+const { launchAdminBot, getAdminStatus } = require('./telegram-admin-bot');
 
 const PORT = process.env.PORT || 3000;
 const startedAt = new Date();
+
+// Обработчик вебхука Telegram. Появляется после запуска админки: до этого
+// момента апдейтов быть не может — Telegram ещё не знает нашего адреса.
+let telegramWebhook = null;
 
 // Кто отсканирует QR — тот и привяжет свой WhatsApp к этому боту. Поэтому страница
 // с кодом закрыта токеном: без него /qr не отдаётся вообще, даже если код готов.
@@ -53,7 +57,11 @@ const routes = {
       JSON.stringify({
         status: 'ok',
         whatsapp: getStatus().connection,
+        // Режимы и состояние админки видно снаружи: чаще всего «бот отвечает не
+        // так» — это незаполненная переменная на сервере, а не поломка в коде.
         shopMode: process.env.SHOP_MODE === 'true',
+        salonMode: process.env.SALON_MODE === 'true',
+        telegram: getAdminStatus(),
         startedAt: startedAt.toISOString(),
         uptimeSeconds: Math.round(process.uptime()),
       })
@@ -99,28 +107,35 @@ const routes = {
   },
 };
 
+function handleRequest(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const route = routes[url.pathname];
+  if (!route) return send(res, 404, 'text/plain; charset=utf-8', 'Не найдено');
+
+  if (url.pathname.startsWith('/qr')) {
+    if (!QR_TOKEN) {
+      return send(
+        res,
+        503,
+        'text/plain; charset=utf-8',
+        'Не задана переменная QR_TOKEN — без неё страница с кодом не открывается.'
+      );
+    }
+    if (!tokenOk(url.searchParams.get('token'))) {
+      return send(res, 403, 'text/plain; charset=utf-8', 'Неверный токен');
+    }
+    req.token = url.searchParams.get('token');
+  }
+
+  return route(req, res);
+}
+
 http
   .createServer((req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const route = routes[url.pathname];
-    if (!route) return send(res, 404, 'text/plain; charset=utf-8', 'Не найдено');
-
-    if (url.pathname.startsWith('/qr')) {
-      if (!QR_TOKEN) {
-        return send(
-          res,
-          503,
-          'text/plain; charset=utf-8',
-          'Не задана переменная QR_TOKEN — без неё страница с кодом не открывается.'
-        );
-      }
-      if (!tokenOk(url.searchParams.get('token'))) {
-        return send(res, 403, 'text/plain; charset=utf-8', 'Неверный токен');
-      }
-      req.token = url.searchParams.get('token');
-    }
-
-    return route(req, res);
+    // Апдейты Telegram приходят POST-ом на секретный путь. Обработчик сам
+    // проверяет путь и секретный заголовок, а чужой запрос передаёт дальше.
+    if (telegramWebhook) return telegramWebhook(req, res, () => handleRequest(req, res));
+    return handleRequest(req, res);
   })
   .listen(PORT, () => console.log(`Health-эндпоинт слушает порт ${PORT}.`));
 
@@ -142,7 +157,15 @@ if (KEEPALIVE_URL && process.env.KEEPALIVE !== 'false') {
   console.log(`Самопинг каждые 10 минут: ${KEEPALIVE_URL}`);
 }
 
-launchAdminBot();
+// Публичный адрес сервиса. Telegram принимает вебхук только по https, поэтому
+// локальный запуск (адреса нет) остаётся на опросе.
+const PUBLIC_URL = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '';
+
+launchAdminBot({ publicUrl: PUBLIC_URL.startsWith('https://') ? PUBLIC_URL : null })
+  .then((handler) => {
+    telegramWebhook = handler;
+  })
+  .catch((err) => console.error('Не удалось запустить Telegram-админку:', err.message));
 
 startBot().catch((err) => {
   console.error('Не удалось запустить WhatsApp-бота:', err);

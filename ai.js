@@ -17,8 +17,8 @@ const {
   getProductNames,
   createAppointment,
   findClientAppointments,
-  findBusyAppointment,
   setAppointmentStatus,
+  listAppointments,
 } = CATALOG_MODE ? require('./db') : {};
 const salon = SALON_MODE ? require('./salon') : null;
 
@@ -242,9 +242,102 @@ function notifyOwnerAboutBooking(appointment, phone) {
   if (appointment.service) lines.push(`Услуга: ${appointment.service}`);
   if (appointment.master) lines.push(`Мастер: ${appointment.master}`);
   if (appointment.note) lines.push(`Пометка: ${appointment.note}`);
-  notifyAdmins(lines.join('\n')).catch((err) =>
-    console.error('Не удалось сообщить владельцу о записи:', err)
-  );
+  // Кнопки прямо в уведомлении: чаще всего владелец открывает его один раз —
+  // когда клиент пришёл. Заставлять его ради галочки идти в список записей и
+  // искать там нужную строку — лишний шаг, который никто не делает.
+  notifyAdmins(lines.join('\n'), {
+    buttons: [
+      [
+        { text: '✅ Клиент пришёл', callback_data: `n_done:${appointment.id}` },
+        { text: '❌ Отменить', callback_data: `appt_cancel:${appointment.id}` },
+      ],
+    ],
+  }).catch((err) => console.error('Не удалось сообщить владельцу о записи:', err));
+}
+
+/* ---------------- свободные окошки ----------------
+   «У вас сегодня есть свободное время?» — самый частый вопрос после цены.
+   Отвечать на него моделью нельзя: она назовёт правдоподобные часы, которых
+   никто не проверял, и клиент придёт на занятое время. Считаем по расписанию. */
+
+const SLOTS_LOOKAHEAD_DAYS = 3;
+
+const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+
+// Записи дня целиком: и свободные окошки, и занятость конкретного часа
+// считаются из одного и того же списка, поэтому расходиться им негде.
+async function loadDay(day) {
+  const { from, to } = salon.localDayRange(day);
+  return listAppointments({ from, to, status: 'active', limit: 200 });
+}
+
+async function loadFreeSlots(day, now) {
+  return salon.freeSlots(day, await loadDay(day), { now });
+}
+
+// Кто свободен в конкретный момент. null — если база не ответила: молча
+// считать время свободным нельзя, тогда двое придут на один час.
+async function checkAvailability(when) {
+  try {
+    return salon.availabilityAt(when, await loadDay(when));
+  } catch (err) {
+    console.error('Не удалось проверить занятость времени:', err.message);
+    return null;
+  }
+}
+
+// Короткая строка «11:00, 13:00, 16:00» для подсказки внутри другого ответа.
+async function freeTimesText(day, { master, limit = 4 } = {}) {
+  try {
+    let slots = await loadFreeSlots(day, new Date());
+    if (master) {
+      slots = slots.filter((s) => s.masters.length === 0 || s.masters.includes(master));
+    }
+    if (slots.length === 0) return null;
+    return slots.slice(0, limit).map((s) => salon.formatTime(s.at)).join(', ');
+  } catch (err) {
+    console.error('Не удалось посчитать свободные окошки:', err.message);
+    return null;
+  }
+}
+
+// Полный ответ на вопрос о свободном времени. Если спрошенный день занят
+// целиком — не отвечаем «нет», а предлагаем ближайший свободный: отказ без
+// альтернативы клиент читает как «идите в другой салон».
+async function handleSlots(day) {
+  const now = new Date();
+  const asked = day || now;
+
+  for (let i = 0; i <= SLOTS_LOOKAHEAD_DAYS; i += 1) {
+    const target = salon.addDays(asked, i);
+    let slots;
+    try {
+      slots = await loadFreeSlots(target, now);
+    } catch (err) {
+      console.error('Не удалось получить расписание:', err.message);
+      return null;
+    }
+    if (slots.length === 0) continue;
+
+    // «Сегодня всё занято» и «сегодня мы уже закрываемся» — разные новости.
+    // Первое говорит клиенту, что салон нарасхват, второе — что он опоздал на
+    // сегодня. Путать их нельзя: в позднем вечернем сообщении первое звучит
+    // как отговорка.
+    const closed = salon
+      .daySlots(asked)
+      .every((at) => at.getTime() < now.getTime() + salon.LEAD_MINUTES * 60 * 1000);
+    const lines = salon.slotLines(slots);
+    const head =
+      i === 0
+        ? `Свободно ${salon.dayLabel(target, now)}:`
+        : `${cap(salon.dayLabel(asked, now))} ${closed ? 'мы уже закрываемся' : 'всё занято'}. ` +
+          `Ближайшее свободное — ${salon.dayLabel(target, now)}:`;
+    const more = slots.length > lines.length ? '\nЕсть время и позже — скажите, когда удобно.' : '';
+
+    return `${head}\n${lines.map((l) => `• ${l}`).join('\n')}${more}\n\nНапишите время — запишу вас.`;
+  }
+
+  return 'Ближайшие дни расписаны полностью. Подскажите, на какой день вам удобно, — посмотрю, что можно освободить.';
 }
 
 async function handleCancel(chatId, phone) {
@@ -298,6 +391,15 @@ async function handleBooking(chatId, userMessage, history, phone) {
     return handleCancel(chatId, phone);
   }
   if (parsed.intent === 'check') return handleCheck(chatId, phone);
+  if (parsed.intent === 'slots') {
+    // Черновик записи не трогаем: спросить «а что вообще свободно?» клиент может
+    // и посреди записи, после этого разговор должен продолжиться с того же места.
+    // День берём из слов клиента, если модель его не вернула, — «завтра» она
+    // в таком вопросе теряет, а показать вместо завтра сегодня хуже, чем молчать.
+    const day = parsed.day || salon.dayFromText(userMessage);
+    const answer = await handleSlots(day);
+    if (answer) return answer;
+  }
   if (parsed.intent === 'none' && !pending) return null;
 
   // Собираем запись из того, что уже знали, и того, что клиент сказал сейчас.
@@ -313,11 +415,18 @@ async function handleBooking(chatId, userMessage, history, phone) {
   if (!draft.when) {
     savePending(chatId, draft);
     // День клиент уже назвал — переспрашиваем только час, иначе разговор
-    // начинается с нуля и это раздражает.
+    // начинается с нуля и это раздражает. И сразу показываем, что свободно:
+    // выбрать из четырёх вариантов проще, чем угадывать время самому.
     if (draft.day) {
-      return `Записываю на ${salon.formatDay(draft.day)}. Во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
+      const free = await freeTimesText(draft.day, { master: draft.master });
+      return free
+        ? `Записываю на ${salon.formatDay(draft.day)}. Свободно: ${free}. Во сколько вам удобно?`
+        : `Записываю на ${salon.formatDay(draft.day)}. Во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
     }
-    return `Конечно, запишу вас! Работаем ${salon.workHoursText()}. На какой день и время вам удобно?`;
+    const today = await freeTimesText(new Date());
+    return today
+      ? `Конечно, запишу вас! Сегодня свободно: ${today}. На какой день и время вам удобно?`
+      : `Конечно, запишу вас! Работаем ${salon.workHoursText()}. На какой день и время вам удобно?`;
   }
 
   const check = salon.checkWhen(draft.when);
@@ -329,12 +438,44 @@ async function handleBooking(chatId, userMessage, history, phone) {
       return `Хорошо! А во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
     }
     if (check.reason === 'closed') {
-      return `В это время мы уже закрыты — работаем ${salon.workHoursText()}. Подберём другое время?`;
+      const free = await freeTimesText(draft.when, { master: draft.master });
+      return free
+        ? `В это время мы уже закрыты — работаем ${salon.workHoursText()}. ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
+        : `В это время мы уже закрыты — работаем ${salon.workHoursText()}. Подберём другое время?`;
     }
     if (check.reason === 'past') {
       return 'Это время уже прошло. На какой ближайший день вас записать?';
     }
     return 'Не поняла время записи. Напишите, пожалуйста, день и час — например «завтра в 15:00».';
+  }
+
+  // Занятость проверяем до вопроса об имени. В обратном порядке разговор выходит
+  // издевательский: бот спрашивает «как вас записать?», клиент представляется —
+  // и только тогда узнаёт, что это время занято.
+  const avail = await checkAvailability(draft.when);
+  const masterBusy = Boolean(
+    avail && draft.master && salon.MASTERS.length > 0 && !avail.masters.includes(draft.master)
+  );
+
+  if (avail && (!avail.free || masterBusy)) {
+    // Занят конкретный мастер, а кресло рядом свободно — предлагаем коллегу.
+    // Клиент чаще хочет попасть в это время, чем именно к этому мастеру.
+    if (masterBusy && avail.free) {
+      savePending(chatId, { ...draft, master: null });
+      return (
+        `Это время уже занято (мастер: ${draft.master}).\n` +
+        `В ${salon.formatTime(draft.when)} свободна запись к другому мастеру: ${avail.masters.join(', ')}. Записать?`
+      );
+    }
+
+    savePending(chatId, { ...draft, when: null });
+    // «Занято, напишите другое время» — это работа, переложенная на клиента.
+    // Сразу называем свободные часы того же дня: так он выбирает, а не гадает.
+    const free = await freeTimesText(draft.when, { master: draft.master });
+    const head = draft.master ? `Это время уже занято (мастер: ${draft.master}).` : 'Это время уже занято.';
+    return free
+      ? `${head} ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
+      : `${head} На этот день свободных окошек не осталось. На какой другой день вас записать?`;
   }
 
   if (!draft.clientName) {
@@ -343,16 +484,6 @@ async function handleBooking(chatId, userMessage, history, phone) {
   }
 
   try {
-    const busy = await findBusyAppointment(draft.when, {
-      master: draft.master,
-      durationMinutes: salon.SLOT_MINUTES,
-    });
-    if (busy) {
-      savePending(chatId, { ...draft, when: null });
-      const who = draft.master ? `У ${draft.master} это` : 'Это';
-      return `${who} время уже занято. Подскажите другое — посмотрю, что свободно.`;
-    }
-
     const appointment = await createAppointment({
       clientName: draft.clientName,
       phone,

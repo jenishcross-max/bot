@@ -293,8 +293,20 @@ async function createAppointment({
     .select()
     .single();
 
-  if (error) throw error;
+  if (error) throw explainAppointmentsError(error);
   return data;
+}
+
+// Таблица бывает создана через интерфейс Supabase — там защита строк (RLS)
+// включена по умолчанию, и запись молча запрещена всем. Postgres сообщает об
+// этом на своём языке, поэтому переводим: иначе в логах лежит «new row violates
+// row-level security policy», а владелец видит только «не смог записать».
+function explainAppointmentsError(error) {
+  if (!/row-level security/i.test(error.message || '')) return error;
+  return new Error(
+    'Таблица appointments закрыта политикой RLS — записи не сохраняются. ' +
+      'Выполните в Supabase (SQL Editor): alter table appointments disable row level security;'
+  );
 }
 
 // from/to — моменты времени; всё остальное необязательно.
@@ -345,27 +357,6 @@ async function findClientAppointments({ phone, chatId, status = 'active', limit 
   return data;
 }
 
-// Занято ли время. Если мастера в салоне не заведены, считаем занятым любое
-// пересечение: у одного кресла не может быть двух клиентов одновременно.
-async function findBusyAppointment(startsAt, { master, durationMinutes = 60 } = {}) {
-  const start = new Date(startsAt);
-  const from = new Date(start.getTime() - (durationMinutes - 1) * 60 * 1000);
-  const to = new Date(start.getTime() + (durationMinutes - 1) * 60 * 1000);
-
-  let query = supabase
-    .from('appointments')
-    .select('*')
-    .eq('status', 'active')
-    .gte('starts_at', from.toISOString())
-    .lte('starts_at', to.toISOString());
-
-  if (master) query = query.eq('master', master);
-
-  const { data, error } = await query.limit(1);
-  if (error) throw error;
-  return data?.[0] || null;
-}
-
 module.exports = {
   LOW_STOCK_THRESHOLD,
   createAppointment,
@@ -373,7 +364,6 @@ module.exports = {
   getAppointment,
   setAppointmentStatus,
   findClientAppointments,
-  findBusyAppointment,
   addProduct,
   listProducts,
   deleteProduct,

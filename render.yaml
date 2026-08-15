@@ -48,6 +48,26 @@ services:
       - key: CURRENCY
         value: сом
 
+      # --- Салон красоты ---
+      # Включите SALON_MODE вместо SHOP_MODE: бот начнёт записывать клиентов,
+      # а в Telegram появятся записи, свободные окошки и кнопки отметки прихода.
+      # Требует таблицы appointments из supabase_schema.sql.
+      - key: SALON_MODE
+        value: "false"
+      - key: SALON_NAME
+        sync: false
+      - key: SALON_TZ
+        value: Asia/Bishkek
+      - key: SALON_HOURS
+        sync: false
+      # Мастера через запятую. Пусто — салон считается «в одно кресло».
+      - key: SALON_MASTERS
+        sync: false
+      - key: SALON_SLOT_MINUTES
+        value: "60"
+      - key: SALON_LEAD_MINUTES
+        value: "30"
+
       # --- Режим «Торгаш»: бот торгуется с юмором, но цену не снижает ---
       - key: HAGGLE_MODE
         value: "false"

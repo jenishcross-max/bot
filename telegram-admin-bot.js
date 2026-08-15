@@ -15,7 +15,6 @@ const {
   listAppointments,
   getAppointment,
   setAppointmentStatus,
-  findBusyAppointment,
 } = require('./db');
 const { parseStockMessage, parseInvoiceImage, transcribeVoice } = require('./stock-ai');
 
@@ -30,16 +29,26 @@ const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!BOT_TOKEN) {
-  console.error('Не задан TELEGRAM_BOT_TOKEN в .env');
-  process.exit(1);
-}
-if (ADMIN_IDS.length === 0) {
-  console.error('Не задан ADMIN_TELEGRAM_IDS в .env (ваш Telegram ID, узнать можно у @userinfobot)');
-  process.exit(1);
-}
+// Чего не хватает для запуска админки. Раньше на пустых переменных здесь стоял
+// process.exit(1) — и это гасило весь сервис: server.js подключает этот файл
+// первой строкой, так что вместе с админкой умирал и WhatsApp-бот. Одна
+// незаполненная переменная — и не работает ничего, причём молча.
+const MISSING_CONFIG = [
+  !BOT_TOKEN && 'TELEGRAM_BOT_TOKEN',
+  ADMIN_IDS.length === 0 && 'ADMIN_TELEGRAM_IDS (ваш Telegram ID, узнать у @userinfobot)',
+].filter(Boolean);
 
-const bot = new Telegraf(BOT_TOKEN);
+// Токен-заглушка нужна только чтобы собрать объект бота: обработчики вешаются
+// на него без обращений к сети, а без токена мы его просто не запускаем.
+const bot = new Telegraf(BOT_TOKEN || '');
+
+// Состояние для health-эндпоинта: по нему видно, живёт админка или молчит и почему.
+const adminStatus = {
+  enabled: MISSING_CONFIG.length === 0,
+  mode: 'выключен',
+  error: MISSING_CONFIG.length > 0 ? `не заданы ${MISSING_CONFIG.join(', ')}` : null,
+  salonMode: SALON_MODE,
+};
 
 const MENU_ADD = SALON_MODE ? '➕ Добавить услугу' : '➕ Добавить товар';
 const MENU_BULK = '⚡ Быстрое заполнение';
@@ -47,11 +56,14 @@ const MENU_LIST = SALON_MODE ? '💇 Услуги и цены' : '📋 Спис�
 const MENU_STATS = '📊 Остатки склада';
 const MENU_HELP = 'ℹ️ Что я умею';
 const MENU_TODAY = '📅 Записи на сегодня';
-const MENU_UPCOMING = '🗓 Активные записи';
+const MENU_UPCOMING = '🗓 Все записи';
+const MENU_SLOTS = '🕒 Свободные окошки';
+const MENU_BOOK = '✍️ Записать клиента';
 
 const mainMenu = SALON_MODE
   ? Markup.keyboard([
       [MENU_TODAY, MENU_UPCOMING],
+      [MENU_SLOTS, MENU_BOOK],
       [MENU_LIST, MENU_ADD],
       [MENU_HELP],
     ]).resize()
@@ -243,7 +255,59 @@ const bulkAddWizard = new Scenes.WizardScene(
   }
 );
 
-const stage = new Scenes.Stage([addProductWizard, bulkAddWizard]);
+// Голос -> текст. Владельцу удобнее наговорить, чем печатать, поэтому голосовые
+// принимаем и в сценариях, и в обычной переписке — расшифровка одна и та же.
+async function voiceToText(ctx) {
+  const file = ctx.message?.voice || ctx.message?.audio;
+  if (!file) return null;
+  const link = await ctx.telegram.getFileLink(file.file_id);
+  const response = await fetch(link.href);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return transcribeVoice(buffer);
+}
+
+// --- Запись клиента владельцем (режим салона) ---
+//
+// Клиент позвонил или пришёл с улицы — запись всё равно должна попасть в общий
+// список, иначе бот в WhatsApp предложит это время второму человеку.
+const bookClientWizard = new Scenes.WizardScene(
+  'book-client',
+  async (ctx) => {
+    await ctx.reply(
+      'Кого записать? Напишите одной строкой или наговорите голосом:\n\n' +
+        '• «Азамат, стрижка, завтра в 15:00»\n' +
+        '• «Нурия, окрашивание, в субботу в 11 к Динаре»\n\n' +
+        'Отправьте «-» чтобы отменить.',
+      Markup.removeKeyboard()
+    );
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    let text = (ctx.message?.text || '').trim();
+    if (!text) {
+      text = (await voiceToText(ctx)) || '';
+      if (text) await ctx.reply(`🎤 Распознал: «${text}»`);
+    }
+
+    if (!text || text === SKIP) {
+      await ctx.reply('Отменено.', mainMenu);
+      return ctx.scene.leave();
+    }
+
+    // Разбираем тем же кодом, что и свободный текст: две дороги к одной записи
+    // рано или поздно разъезжаются в поведении, а чинить приходится обе.
+    const booked = await handleOwnerBooking(ctx, text);
+    if (!booked) {
+      await ctx.reply(
+        'Не понял, кого и на когда записать. Попробуйте так: «Азамат, стрижка, завтра в 15:00».',
+        mainMenu
+      );
+    }
+    return ctx.scene.leave();
+  }
+);
+
+const stage = new Scenes.Stage([addProductWizard, bulkAddWizard, bookClientWizard]);
 bot.use(session());
 bot.use(stage.middleware());
 
@@ -252,15 +316,18 @@ bot.use(stage.middleware());
 const SALON_HELP_TEXT =
   'Я веду записи салона.\n\n' +
   '📅 «Записи на сегодня» — кто и во сколько придёт сегодня.\n' +
-  '🗓 «Активные записи» — все предстоящие, по дням.\n' +
+  '🗓 «Все записи» — все предстоящие, по дням.\n' +
+  '🕒 «Свободные окошки» — что осталось на день; стрелками листаются другие дни.\n' +
+  '✍️ «Записать клиента» — записать того, кто позвонил или пришёл сам.\n\n' +
   'Кнопка ✅ отмечает, что клиент пришёл, ❌ — отменяет запись.\n\n' +
-  'Записать клиента самому — просто напишите или наговорите голосом:\n' +
+  'Записать можно и без кнопок — просто напишите или наговорите голосом:\n' +
   '• «запиши Азамата завтра в 15:00 на стрижку»\n' +
   '• «Нурия, окрашивание, в субботу в 11 к Динаре»\n\n' +
   'Услуги и цены ведутся так же, как товары:\n' +
   '• «стрижка мужская 500» — добавить или поправить цену\n' +
   '• «удали услугу маникюр» — убрать\n\n' +
-  'Когда клиент запишется через WhatsApp — я сразу пришлю сюда его имя, время и номер.';
+  'Когда клиент запишется через WhatsApp — я сразу пришлю сюда его имя, время и номер, ' +
+  'а отметить приход можно прямо из уведомления.';
 
 const SHOP_HELP_TEXT =
   'Я веду склад магазина. Пишите или наговаривайте голосом обычными словами:\n\n' +
@@ -398,6 +465,46 @@ async function renderUpcoming() {
   };
 }
 
+// Свободные окошки. Считаются тем же кодом, что и для клиента в WhatsApp:
+// разойдись эти два расчёта — владелец пообещает по телефону время, которое
+// бот в этот момент уже отдал другому.
+const SLOTS_MAX_OFFSET = 14;
+
+async function renderSlots(offset = 0) {
+  const day = salon.addDays(new Date(), offset);
+  const { from, to } = salon.localDayRange(day);
+  const busy = await listAppointments({ from, to, status: 'active', limit: 200 });
+  const slots = salon.freeSlots(day, busy);
+
+  const nav = [];
+  if (offset > 0) nav.push(Markup.button.callback('← назад', `slots:${offset - 1}`));
+  if (offset < SLOTS_MAX_OFFSET) {
+    nav.push(Markup.button.callback('следующий день →', `slots:${offset + 1}`));
+  }
+  const keyboard = Markup.inlineKeyboard([nav]);
+
+  const head = `🕒 Свободно ${salon.dayLabel(day)}\n${salon.formatDay(day)}`;
+  if (slots.length === 0) {
+    return {
+      text: `${head}\n\nОкошек нет — день расписан полностью.`,
+      keyboard,
+    };
+  }
+
+  return {
+    text:
+      `${head}\n\n` +
+      salon.slotLines(slots, { limit: 24 }).join('\n') +
+      `\n\nВсего свободно: ${slots.length}.`,
+    keyboard,
+  };
+}
+
+async function replySlots(ctx) {
+  const { text, keyboard } = await renderSlots(0);
+  await ctx.reply(text, keyboard);
+}
+
 async function replyToday(ctx) {
   const { text, keyboard } = await renderToday();
   await ctx.reply(text, keyboard || mainMenu);
@@ -416,33 +523,67 @@ async function refreshView(ctx, appointment) {
   await ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard || mainMenu));
 }
 
-bot.action(/^appt_done:(\d+)$/, async (ctx) => {
-  const updated = await setAppointmentStatus(Number(ctx.match[1]), 'done');
-  await ctx.answerCbQuery(`${updated.client_name} — отмечен`);
-  await refreshView(ctx, updated);
-});
+// Кнопки записей живут только в режиме салона: без него salon = null, и любое
+// нажатие упало бы внутри обработчика.
+if (SALON_MODE) {
+  bot.action(/^appt_done:(\d+)$/, async (ctx) => {
+    const updated = await setAppointmentStatus(Number(ctx.match[1]), 'done');
+    await ctx.answerCbQuery(`${updated.client_name} — отмечен`);
+    await refreshView(ctx, updated);
+  });
 
-bot.action(/^appt_cancel:(\d+)$/, async (ctx) => {
-  const appointment = await getAppointment(Number(ctx.match[1]));
-  await ctx.answerCbQuery();
-  await ctx.reply(
-    `Отменить запись: ${appointment.client_name}, ${salon.formatWhen(new Date(appointment.starts_at))}?`,
-    Markup.inlineKeyboard([
-      [
-        Markup.button.callback('✅ Да, отменить', `appt_cancel_yes:${appointment.id}`),
-        Markup.button.callback('← Нет', 'cancel'),
-      ],
-    ])
-  );
-});
+  // То же самое, но нажатое в уведомлении о новой записи. Список сюда
+  // подставлять нельзя: владелец должен видеть, на какую запись он нажал,
+  // а не получить вместо уведомления расписание дня.
+  bot.action(/^n_done:(\d+)$/, async (ctx) => {
+    const updated = await setAppointmentStatus(Number(ctx.match[1]), 'done');
+    await ctx.answerCbQuery(`${updated.client_name} — отмечен`);
+    const text = ctx.callbackQuery?.message?.text || 'Запись';
+    await ctx.editMessageText(`${text}\n\n✔️ Клиент пришёл.`).catch(() => {});
+  });
 
-bot.action(/^appt_cancel_yes:(\d+)$/, async (ctx) => {
-  const updated = await setAppointmentStatus(Number(ctx.match[1]), 'cancelled');
-  await ctx.answerCbQuery('Запись отменена');
-  await ctx.editMessageText(
-    `❌ Запись отменена: ${updated.client_name}, ${salon.formatWhen(new Date(updated.starts_at))}`
-  );
-});
+  bot.action(/^appt_cancel:(\d+)$/, async (ctx) => {
+    const appointment = await getAppointment(Number(ctx.match[1]));
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      `Отменить запись: ${appointment.client_name}, ${salon.formatWhen(new Date(appointment.starts_at))}?`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback('✅ Да, отменить', `appt_cancel_yes:${appointment.id}`),
+          Markup.button.callback('← Нет', 'cancel'),
+        ],
+      ])
+    );
+  });
+
+  bot.action(/^appt_cancel_yes:(\d+)$/, async (ctx) => {
+    const updated = await setAppointmentStatus(Number(ctx.match[1]), 'cancelled');
+    await ctx.answerCbQuery('Запись отменена');
+    await ctx.editMessageText(
+      `❌ Запись отменена: ${updated.client_name}, ${salon.formatWhen(new Date(updated.starts_at))}`
+    );
+  });
+
+  // Запись поверх занятого времени — только по явному подтверждению владельца.
+  bot.action('force_book', async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = ctx.session?.forcedBooking;
+    if (!draft) {
+      await ctx.editMessageText('Запись уже неактуальна — напишите её заново.');
+      return;
+    }
+    ctx.session.forcedBooking = null;
+    const appointment = await createAppointment({ ...draft, source: 'telegram' });
+    await ctx.editMessageText(bookedText(appointment));
+  });
+
+  bot.action(/^slots:(\d+)$/, async (ctx) => {
+    const offset = Math.min(Number(ctx.match[1]), SLOTS_MAX_OFFSET);
+    const { text, keyboard } = await renderSlots(offset);
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard));
+  });
+}
 
 // Владелец записывает клиента сам — он принял звонок, пока бот спал.
 // Возвращает true, если сообщение было про запись и обработано здесь.
@@ -486,16 +627,40 @@ async function handleOwnerBooking(ctx, text) {
     return true;
   }
 
-  const busy = await findBusyAppointment(parsed.when, {
-    master: parsed.master,
-    durationMinutes: salon.SLOT_MINUTES,
-  });
-  if (busy) {
+  // Занятость считаем тем же кодом, что и бот в WhatsApp: один расчёт на двоих,
+  // иначе владелец и бот начнут расходиться в том, какое время свободно.
+  const { from, to } = salon.localDayRange(parsed.when);
+  const dayBusy = await listAppointments({ from, to, status: 'active', limit: 200 });
+  const avail = salon.availabilityAt(parsed.when, dayBusy);
+  const conflict = parsed.master
+    ? avail.taken.find((a) => a.master === parsed.master) || avail.taken[0]
+    : avail.taken[0];
+  const masterBusy = Boolean(
+    parsed.master && salon.MASTERS.length > 0 && !avail.masters.includes(parsed.master)
+  );
+
+  if (!avail.free || masterBusy) {
+    // Владелец главнее расписания: он видит зал и знает, поместится ли ещё один
+    // клиент (мама с ребёнком, второе кресло, «сушка пока красится»). Поэтому не
+    // отказываем, а предупреждаем и даём записать всё равно.
+    ctx.session.forcedBooking = {
+      clientName: parsed.clientName,
+      service: parsed.service,
+      master: parsed.master,
+      startsAt: new Date(parsed.when).toISOString(),
+      note: parsed.note,
+    };
     await ctx.reply(
-      `⚠️ На это время уже записан ${busy.client_name}` +
-        `${busy.master ? ` к мастеру ${busy.master}` : ''}.\n` +
-        'Если это не помеха — напишите время чуть иначе, я запишу.',
-      mainMenu
+      `⚠️ На это время уже есть запись${conflict ? `: ${conflict.client_name}` : ''}` +
+        `${conflict && conflict.master ? ` к мастеру ${conflict.master}` : ''}.\n` +
+        (avail.free ? `Свободны: ${avail.masters.join(', ')}.\n` : '') +
+        'Записать всё равно?',
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback('✅ Да, записать', 'force_book'),
+          Markup.button.callback('← Нет', 'cancel'),
+        ],
+      ])
     );
     return true;
   }
@@ -509,20 +674,27 @@ async function handleOwnerBooking(ctx, text) {
     note: parsed.note,
   });
 
-  await ctx.reply(
-    `✅ Записал: ${appointment.client_name}, ${salon.formatWhen(new Date(appointment.starts_at))}` +
-      `${appointment.service ? `\nУслуга: ${appointment.service}` : ''}` +
-      `${appointment.master ? `\nМастер: ${appointment.master}` : ''}`,
-    mainMenu
-  );
+  await ctx.reply(bookedText(appointment), mainMenu);
   return true;
+}
+
+function bookedText(a) {
+  return (
+    `✅ Записал: ${a.client_name}, ${salon.formatWhen(new Date(a.starts_at))}` +
+    `${a.service ? `\nУслуга: ${a.service}` : ''}` +
+    `${a.master ? `\nМастер: ${a.master}` : ''}`
+  );
 }
 
 if (SALON_MODE) {
   bot.command('today', replyToday);
   bot.command('records', replyUpcoming);
+  bot.command('slots', replySlots);
+  bot.command('book', (ctx) => ctx.scene.enter('book-client'));
   bot.hears(MENU_TODAY, replyToday);
   bot.hears(MENU_UPCOMING, replyUpcoming);
+  bot.hears(MENU_SLOTS, replySlots);
+  bot.hears(MENU_BOOK, (ctx) => ctx.scene.enter('book-client'));
 }
 
 bot.command('list', replyProductList);
@@ -720,12 +892,7 @@ bot.on('text', async (ctx) => {
 // Голосовые сообщения: расшифровываем через Whisper и обрабатываем как обычный текст.
 bot.on(['voice', 'audio'], async (ctx) => {
   try {
-    const file = ctx.message.voice || ctx.message.audio;
-    const link = await ctx.telegram.getFileLink(file.file_id);
-    const response = await fetch(link.href);
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    const text = await transcribeVoice(buffer);
+    const text = await voiceToText(ctx);
     if (!text) {
       await ctx.reply('Не удалось разобрать голосовое сообщение. Попробуйте ещё раз.');
       return;
@@ -766,20 +933,115 @@ bot.catch((err, ctx) => {
   ctx.reply('Произошла ошибка. Попробуйте ещё раз.').catch(() => {});
 });
 
-function launchAdminBot() {
-  process.once('SIGINT', () => bot.stop('SIGINT'));
-  process.once('SIGTERM', () => bot.stop('SIGTERM'));
-  // bot.launch() не резолвится, пока бот работает, поэтому не ждём его здесь.
-  bot.launch().catch((err) => console.error('Не удалось запустить Telegram-бота:', err));
-  console.log('Telegram-админка запущена.');
+/* ---------------- запуск ----------------
+
+   Получать сообщения можно двумя способами, и на Render работает только один.
+
+   • Опрос (polling): бот сам раз в секунду спрашивает Telegram «что нового?».
+     Требует, чтобы процесс всё время не спал. На бесплатном тарифе Render сервис
+     засыпает через ~15 минут без входящих HTTP-запросов, и спящий бот ничего не
+     опрашивает — со стороны это выглядит как «телеграм-бот вообще не работает».
+   • Вебхук: Telegram сам стучится к нам по HTTPS. Этот стук ещё и будит уснувший
+     сервис, поэтому на Render админка отвечает всегда.
+
+   Поэтому: есть публичный адрес — вебхук, нет (локальный запуск) — опрос. */
+
+const crypto = require('crypto');
+
+// Путь секретный: кто его знает, тот может слать боту поддельные апдейты.
+// Хеш токена стабилен между перезапусками и сам токен не показывает.
+function webhookPath() {
+  return '/telegram/' + crypto.createHash('sha256').update(BOT_TOKEN).digest('hex').slice(0, 32);
+}
+
+const COMMANDS = SALON_MODE
+  ? [
+      { command: 'today', description: 'Записи на сегодня' },
+      { command: 'records', description: 'Все предстоящие записи' },
+      { command: 'slots', description: 'Свободные окошки' },
+      { command: 'book', description: 'Записать клиента' },
+      { command: 'list', description: 'Услуги и цены' },
+      { command: 'help', description: 'Что я умею' },
+    ]
+  : [
+      { command: 'list', description: 'Список товаров' },
+      { command: 'stats', description: 'Остатки склада' },
+      { command: 'bulk', description: 'Добавить списком' },
+      { command: 'help', description: 'Что я умею' },
+    ];
+
+// Возвращает обработчик вебхука для HTTP-сервера, либо null — тогда работает опрос.
+// server.js подключает его к своему серверу, отдельный порт заводить не нужно.
+async function launchAdminBot({ publicUrl } = {}) {
+  if (!adminStatus.enabled) {
+    console.error(
+      `Telegram-админка не запущена: ${adminStatus.error}. ` +
+        'WhatsApp-бот при этом работает — заполните переменные и перезапустите сервис.'
+    );
+    return null;
+  }
+
+  // Список команд в меню Telegram: без него владелец не знает, что боту писать.
+  bot.telegram
+    .setMyCommands(COMMANDS)
+    .catch((err) => console.error('Не удалось обновить меню команд:', err.message));
+
+  const stop = (reason) => {
+    try {
+      bot.stop(reason);
+    } catch {
+      // bot.stop() падает, если бот не в режиме опроса. Гасить процесс из-за
+      // этого незачем — мы и так завершаемся.
+    }
+  };
+  process.once('SIGINT', () => stop('SIGINT'));
+  process.once('SIGTERM', () => stop('SIGTERM'));
+
+  if (publicUrl) {
+    try {
+      const path = webhookPath();
+      const secretToken = crypto
+        .createHash('sha256')
+        .update(`${BOT_TOKEN}:webhook`)
+        .digest('hex')
+        .slice(0, 48);
+      const handler = await bot.createWebhook({ domain: publicUrl, path, secret_token: secretToken });
+      adminStatus.mode = 'вебхук';
+      adminStatus.error = null;
+      console.log(`Telegram-админка на вебхуке: ${publicUrl}${path}`);
+      return handler;
+    } catch (err) {
+      adminStatus.error = err.message;
+      console.error('Не удалось поставить вебхук, перехожу на опрос:', err.message);
+    }
+  }
+
+  // bot.launch() в режиме опроса не резолвится, пока бот работает, поэтому не ждём.
+  bot
+    .launch()
+    .catch((err) => console.error('Не удалось запустить Telegram-бота:', err.message));
+  adminStatus.mode = 'опрос';
+  console.log(
+    'Telegram-админка запущена (опрос). Если этот же бот работает на сервере — ' +
+      'запуск опроса снял там вебхук, после локальной работы перезапустите сервис.'
+  );
+  return null;
+}
+
+function getAdminStatus() {
+  return { ...adminStatus };
 }
 
 // Запуск напрямую (npm run start:admin) — стартуем сразу; при импорте из server.js
 // запуском управляет вызывающий.
 if (require.main === module) {
+  if (!adminStatus.enabled) {
+    console.error(`Не запускаюсь: ${adminStatus.error}. Заполните .env.`);
+    process.exit(1);
+  }
   launchAdminBot();
 }
 
-// renderToday/renderUpcoming наружу — это готовые экраны записей, их удобно
-// проверять отдельно от Telegram и переиспользовать в сводках.
-module.exports = { launchAdminBot, renderToday, renderUpcoming };
+// renderToday/renderUpcoming/renderSlots наружу — это готовые экраны записей,
+// их удобно проверять отдельно от Telegram и переиспользовать в сводках.
+module.exports = { launchAdminBot, getAdminStatus, renderToday, renderUpcoming, renderSlots };
