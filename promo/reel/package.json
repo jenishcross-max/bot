@@ -1,0 +1,22 @@
+{
+  "name": "salon-reel",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Промо-ролик для салонов: Remotion, 1080x1920, озвучка ElevenLabs",
+  "scripts": {
+    "studio": "remotion studio",
+    "render": "remotion render src/index.ts SalonReel out/salon-reel.mp4 --codec h264 --crf 16",
+    "audio": "node scripts/gen-music.mjs && node scripts/gen-sfx.mjs"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.0",
+    "@remotion/google-fonts": "^4.0.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "typescript": "5.6.3"
+  }
+}

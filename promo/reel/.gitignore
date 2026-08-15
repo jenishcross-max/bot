@@ -1,0 +1,4 @@
+node_modules/
+out/
+# Звуки синтезируются скриптами: npm run audio
+public/sfx/*.wav
