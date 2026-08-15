@@ -260,8 +260,120 @@ async function applyStockAction(action) {
   return { action: 'ignored', name };
 }
 
+/* ---------------- записи клиентов (режим салона) ---------------- */
+
+// Активная запись — та, которую ещё не отменили и по которой клиент не пришёл.
+// Статусы держим строками, а не булевыми флагами: «отменена» и «пришёл» —
+// разные вещи, и владельцу в истории важно видеть, чем закончилось.
+const APPOINTMENT_STATUSES = ['active', 'done', 'cancelled'];
+
+async function createAppointment({
+  clientName,
+  phone,
+  chatId,
+  service,
+  master,
+  startsAt,
+  source = 'whatsapp',
+  note,
+}) {
+  const { data, error } = await supabase
+    .from('appointments')
+    .insert({
+      client_name: clientName,
+      phone: phone ? String(phone).replace(/\D/g, '') : null,
+      chat_id: chatId || null,
+      service: service || null,
+      master: master || null,
+      starts_at: new Date(startsAt).toISOString(),
+      status: 'active',
+      source,
+      note: note || null,
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+// from/to — моменты времени; всё остальное необязательно.
+async function listAppointments({ from, to, status = 'active', limit = 50 } = {}) {
+  let query = supabase.from('appointments').select('*').order('starts_at', { ascending: true });
+
+  if (status) query = query.eq('status', status);
+  if (from) query = query.gte('starts_at', new Date(from).toISOString());
+  if (to) query = query.lt('starts_at', new Date(to).toISOString());
+
+  const { data, error } = await query.limit(limit);
+  if (error) throw error;
+  return data;
+}
+
+async function getAppointment(id) {
+  const { data, error } = await supabase.from('appointments').select('*').eq('id', id).single();
+  if (error) throw error;
+  return data;
+}
+
+async function setAppointmentStatus(id, status) {
+  if (!APPOINTMENT_STATUSES.includes(status)) throw new Error(`Неизвестный статус записи: ${status}`);
+  const { data, error } = await supabase
+    .from('appointments')
+    .update({ status })
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+// Записи конкретного клиента — по номеру или по чату WhatsApp. Номер не всегда
+// известен (WhatsApp отдаёт LID), поэтому ищем по тому, что есть.
+async function findClientAppointments({ phone, chatId, status = 'active', limit = 10 }) {
+  const digits = phone ? String(phone).replace(/\D/g, '') : null;
+  if (!digits && !chatId) return [];
+
+  let query = supabase.from('appointments').select('*').order('starts_at', { ascending: true });
+  if (status) query = query.eq('status', status);
+  query = digits && chatId
+    ? query.or(`phone.eq.${digits},chat_id.eq.${chatId}`)
+    : query.eq(digits ? 'phone' : 'chat_id', digits || chatId);
+
+  const { data, error } = await query.limit(limit);
+  if (error) throw error;
+  return data;
+}
+
+// Занято ли время. Если мастера в салоне не заведены, считаем занятым любое
+// пересечение: у одного кресла не может быть двух клиентов одновременно.
+async function findBusyAppointment(startsAt, { master, durationMinutes = 60 } = {}) {
+  const start = new Date(startsAt);
+  const from = new Date(start.getTime() - (durationMinutes - 1) * 60 * 1000);
+  const to = new Date(start.getTime() + (durationMinutes - 1) * 60 * 1000);
+
+  let query = supabase
+    .from('appointments')
+    .select('*')
+    .eq('status', 'active')
+    .gte('starts_at', from.toISOString())
+    .lte('starts_at', to.toISOString());
+
+  if (master) query = query.eq('master', master);
+
+  const { data, error } = await query.limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
 module.exports = {
   LOW_STOCK_THRESHOLD,
+  createAppointment,
+  listAppointments,
+  getAppointment,
+  setAppointmentStatus,
+  findClientAppointments,
+  findBusyAppointment,
   addProduct,
   listProducts,
   deleteProduct,

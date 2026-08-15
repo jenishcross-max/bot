@@ -11,8 +11,18 @@ const {
   applyStockAction,
   restoreProduct,
   getStockSummary,
+  createAppointment,
+  listAppointments,
+  getAppointment,
+  setAppointmentStatus,
+  findBusyAppointment,
 } = require('./db');
 const { parseStockMessage, parseInvoiceImage, transcribeVoice } = require('./stock-ai');
+
+// Режим салона: вместо склада владельцу нужны записи клиентов. Каталог остаётся —
+// в нём лежат услуги с ценами, — но главный экран другой.
+const SALON_MODE = process.env.SALON_MODE === 'true';
+const salon = SALON_MODE ? require('./salon') : null;
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
@@ -31,22 +41,34 @@ if (ADMIN_IDS.length === 0) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-const MENU_ADD = '➕ Добавить товар';
+const MENU_ADD = SALON_MODE ? '➕ Добавить услугу' : '➕ Добавить товар';
 const MENU_BULK = '⚡ Быстрое заполнение';
-const MENU_LIST = '📋 Список товаров';
+const MENU_LIST = SALON_MODE ? '💇 Услуги и цены' : '📋 Список товаров';
 const MENU_STATS = '📊 Остатки склада';
 const MENU_HELP = 'ℹ️ Что я умею';
+const MENU_TODAY = '📅 Записи на сегодня';
+const MENU_UPCOMING = '🗓 Активные записи';
 
-const mainMenu = Markup.keyboard([
-  [MENU_ADD, MENU_BULK],
-  [MENU_LIST, MENU_STATS],
-  [MENU_HELP],
-]).resize();
+const mainMenu = SALON_MODE
+  ? Markup.keyboard([
+      [MENU_TODAY, MENU_UPCOMING],
+      [MENU_LIST, MENU_ADD],
+      [MENU_HELP],
+    ]).resize()
+  : Markup.keyboard([
+      [MENU_ADD, MENU_BULK],
+      [MENU_LIST, MENU_STATS],
+      [MENU_HELP],
+    ]).resize();
 
 bot.use((ctx, next) => {
   const userId = String(ctx.from?.id || '');
   if (!ADMIN_IDS.includes(userId)) {
-    return ctx.reply('Доступ запрещён. Этот бот только для владельца магазина.');
+    return ctx.reply(
+      SALON_MODE
+        ? 'Доступ запрещён. Этот бот только для владельца салона.'
+        : 'Доступ запрещён. Этот бот только для владельца магазина.'
+    );
   }
   return next();
 });
@@ -227,7 +249,20 @@ bot.use(stage.middleware());
 
 // --- Команды и меню ---
 
-const HELP_TEXT =
+const SALON_HELP_TEXT =
+  'Я веду записи салона.\n\n' +
+  '📅 «Записи на сегодня» — кто и во сколько придёт сегодня.\n' +
+  '🗓 «Активные записи» — все предстоящие, по дням.\n' +
+  'Кнопка ✅ отмечает, что клиент пришёл, ❌ — отменяет запись.\n\n' +
+  'Записать клиента самому — просто напишите или наговорите голосом:\n' +
+  '• «запиши Азамата завтра в 15:00 на стрижку»\n' +
+  '• «Нурия, окрашивание, в субботу в 11 к Динаре»\n\n' +
+  'Услуги и цены ведутся так же, как товары:\n' +
+  '• «стрижка мужская 500» — добавить или поправить цену\n' +
+  '• «удали услугу маникюр» — убрать\n\n' +
+  'Когда клиент запишется через WhatsApp — я сразу пришлю сюда его имя, время и номер.';
+
+const SHOP_HELP_TEXT =
   'Я веду склад магазина. Пишите или наговаривайте голосом обычными словами:\n\n' +
   '• «приехало 10 пачек сухарей» — приход\n' +
   '• «продано 5 чипсов» — списание\n' +
@@ -241,27 +276,31 @@ const HELP_TEXT =
   BULK_EXAMPLE +
   '\n\nКогда клиент в WhatsApp попросит менеджера — я пришлю сюда его номер и переписку.';
 
-bot.start((ctx) => ctx.reply(`Админ-бот магазина.\n\n${HELP_TEXT}`, mainMenu));
+const HELP_TEXT = SALON_MODE ? SALON_HELP_TEXT : SHOP_HELP_TEXT;
+
+bot.start((ctx) =>
+  ctx.reply(`${SALON_MODE ? 'Админ-бот салона' : 'Админ-бот магазина'}.\n\n${HELP_TEXT}`, mainMenu)
+);
 
 bot.command('add', (ctx) => ctx.scene.enter('add-product'));
 
 function productLine(p) {
-  return (
-    `#${p.id} ${p.name} — ${p.price ?? '—'}${p.category ? ` [${p.category}]` : ''}` +
-    `, остаток: ${p.quantity ?? 0}${p.in_stock ? '' : ' (нет в наличии)'}`
-  );
+  const head = `#${p.id} ${p.name} — ${p.price ?? '—'}${p.category ? ` [${p.category}]` : ''}`;
+  // У услуги нет остатка: «стрижка, 3 шт.» — бессмыслица.
+  if (SALON_MODE) return head;
+  return `${head}, остаток: ${p.quantity ?? 0}${p.in_stock ? '' : ' (нет в наличии)'}`;
 }
 
 async function replyProductList(ctx) {
   const products = await listProducts({ limit: 30 });
   if (products.length === 0) {
-    await ctx.reply('Товаров пока нет. Нажмите «➕ Добавить товар».', mainMenu);
+    await ctx.reply(`${SALON_MODE ? 'Услуг' : 'Товаров'} пока нет. Нажмите «${MENU_ADD}».`, mainMenu);
     return;
   }
   await ctx.reply(
     products.map(productLine).join('\n'),
     Markup.inlineKeyboard([
-      [Markup.button.callback('🗑 Удалить товар', 'pick_delete')],
+      [Markup.button.callback(SALON_MODE ? '🗑 Удалить услугу' : '🗑 Удалить товар', 'pick_delete')],
       [Markup.button.callback('⚡ Добавить списком', 'bulk_add')],
     ])
   );
@@ -285,6 +324,205 @@ async function replyStockSummary(ctx) {
     lines.push('', '❌ Нет в наличии:', ...s.outOfStock.map((p) => `- ${p.name}`));
   }
   await ctx.reply(lines.join('\n'), mainMenu);
+}
+
+/* ---------------- записи клиентов (режим салона) ---------------- */
+
+function phoneText(a) {
+  if (a.phone) return `+${a.phone}`;
+  return a.chat_id ? 'написал в WhatsApp' : 'номер не указан';
+}
+
+function appointmentLine(a) {
+  const time = salon.formatTime(new Date(a.starts_at));
+  const head = [a.client_name, a.service, a.master && `мастер ${a.master}`].filter(Boolean).join(' · ');
+  const mark = a.status === 'done' ? '✔ ' : '';
+  const tail = [phoneText(a), a.note].filter(Boolean).join(' · ');
+  return `${mark}${time}  ${head}\n         ${tail}`;
+}
+
+// Кнопки только у предстоящих записей: отмечать приход у отменённой нечего.
+function appointmentButtons(list) {
+  return list
+    .filter((a) => a.status === 'active')
+    .slice(0, 10)
+    .map((a) => [
+      Markup.button.callback(
+        `✅ ${salon.formatTime(new Date(a.starts_at))} ${a.client_name}`,
+        `appt_done:${a.id}`
+      ),
+      Markup.button.callback('❌ отменить', `appt_cancel:${a.id}`),
+    ]);
+}
+
+async function renderToday() {
+  const { from, to } = salon.localDayRange();
+  // Берём все статусы и сами убираем отменённые: пришедших клиентов из списка
+  // выкидывать нельзя — владелец смотрит в него весь день и должен видеть,
+  // кто уже был, а не только кто остался.
+  const all = await listAppointments({ from, to, status: null, limit: 50 });
+  const list = all.filter((a) => a.status !== 'cancelled');
+
+  if (list.length === 0) {
+    return { text: `📅 ${salon.formatDay(new Date())}\n\nНа сегодня записей нет.` };
+  }
+
+  const left = list.filter((a) => a.status === 'active').length;
+  return {
+    text:
+      `📅 ${salon.formatDay(new Date())}\n\n` +
+      list.map(appointmentLine).join('\n\n') +
+      `\n\nВсего ${list.length}, впереди ${left}.`,
+    keyboard: Markup.inlineKeyboard(appointmentButtons(list)),
+  };
+}
+
+async function renderUpcoming() {
+  const list = await listAppointments({ from: new Date(), status: 'active', limit: 30 });
+  if (list.length === 0) {
+    return { text: 'Активных записей нет. Как только клиент запишется в WhatsApp — она появится здесь.' };
+  }
+
+  // Группируем по дням: сплошной список из двадцати строк глазами не читается.
+  const days = new Map();
+  for (const a of list) {
+    const key = salon.formatDay(new Date(a.starts_at));
+    if (!days.has(key)) days.set(key, []);
+    days.get(key).push(a);
+  }
+
+  const blocks = [...days].map(([day, items]) => `📅 ${day}\n\n${items.map(appointmentLine).join('\n\n')}`);
+  return {
+    text: `🗓 Активных записей: ${list.length}\n\n${blocks.join('\n\n')}`,
+    keyboard: Markup.inlineKeyboard(appointmentButtons(list)),
+  };
+}
+
+async function replyToday(ctx) {
+  const { text, keyboard } = await renderToday();
+  await ctx.reply(text, keyboard || mainMenu);
+}
+
+async function replyUpcoming(ctx) {
+  const { text, keyboard } = await renderUpcoming();
+  await ctx.reply(text, keyboard || mainMenu);
+}
+
+// После отметки перерисовываем тот же экран: иначе владелец видит старый список
+// с кнопкой, которую уже нажал, и жмёт её второй раз.
+async function refreshView(ctx, appointment) {
+  const today = salon.sameLocalDay(new Date(appointment.starts_at), new Date());
+  const { text, keyboard } = today ? await renderToday() : await renderUpcoming();
+  await ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard || mainMenu));
+}
+
+bot.action(/^appt_done:(\d+)$/, async (ctx) => {
+  const updated = await setAppointmentStatus(Number(ctx.match[1]), 'done');
+  await ctx.answerCbQuery(`${updated.client_name} — отмечен`);
+  await refreshView(ctx, updated);
+});
+
+bot.action(/^appt_cancel:(\d+)$/, async (ctx) => {
+  const appointment = await getAppointment(Number(ctx.match[1]));
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    `Отменить запись: ${appointment.client_name}, ${salon.formatWhen(new Date(appointment.starts_at))}?`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback('✅ Да, отменить', `appt_cancel_yes:${appointment.id}`),
+        Markup.button.callback('← Нет', 'cancel'),
+      ],
+    ])
+  );
+});
+
+bot.action(/^appt_cancel_yes:(\d+)$/, async (ctx) => {
+  const updated = await setAppointmentStatus(Number(ctx.match[1]), 'cancelled');
+  await ctx.answerCbQuery('Запись отменена');
+  await ctx.editMessageText(
+    `❌ Запись отменена: ${updated.client_name}, ${salon.formatWhen(new Date(updated.starts_at))}`
+  );
+});
+
+// Владелец записывает клиента сам — он принял звонок, пока бот спал.
+// Возвращает true, если сообщение было про запись и обработано здесь.
+async function handleOwnerBooking(ctx, text) {
+  let services = [];
+  try {
+    services = await getProductNames();
+  } catch (err) {
+    console.error('Не удалось получить список услуг:', err.message);
+  }
+
+  const parsed = await salon.parseBookingRequest(text, { services });
+  if (!parsed || parsed.intent !== 'book') return false;
+
+  if (!parsed.when || !parsed.clientName) {
+    const missing = [
+      !parsed.clientName && 'имя клиента',
+      !parsed.when && (parsed.day ? 'время' : 'день и время'),
+    ]
+      .filter(Boolean)
+      .join(' и ');
+    await ctx.reply(
+      `Понял, что нужно записать, но не хватает: ${missing}.\n` +
+        'Напишите одной строкой, например: «запиши Азамата завтра в 15:00 на стрижку».',
+      mainMenu
+    );
+    return true;
+  }
+
+  const check = salon.checkWhen(parsed.when);
+  if (!check.ok) {
+    const why =
+      check.reason === 'no_clock'
+        ? 'не указано время'
+        : check.reason === 'closed'
+          ? `в это время салон закрыт (работаем ${salon.workHoursText()})`
+          : check.reason === 'past'
+            ? 'это время уже прошло'
+            : 'не понял время';
+    await ctx.reply(`Не записал: ${why}. Напишите другое время.`, mainMenu);
+    return true;
+  }
+
+  const busy = await findBusyAppointment(parsed.when, {
+    master: parsed.master,
+    durationMinutes: salon.SLOT_MINUTES,
+  });
+  if (busy) {
+    await ctx.reply(
+      `⚠️ На это время уже записан ${busy.client_name}` +
+        `${busy.master ? ` к мастеру ${busy.master}` : ''}.\n` +
+        'Если это не помеха — напишите время чуть иначе, я запишу.',
+      mainMenu
+    );
+    return true;
+  }
+
+  const appointment = await createAppointment({
+    clientName: parsed.clientName,
+    service: parsed.service,
+    master: parsed.master,
+    startsAt: parsed.when,
+    source: 'telegram',
+    note: parsed.note,
+  });
+
+  await ctx.reply(
+    `✅ Записал: ${appointment.client_name}, ${salon.formatWhen(new Date(appointment.starts_at))}` +
+      `${appointment.service ? `\nУслуга: ${appointment.service}` : ''}` +
+      `${appointment.master ? `\nМастер: ${appointment.master}` : ''}`,
+    mainMenu
+  );
+  return true;
+}
+
+if (SALON_MODE) {
+  bot.command('today', replyToday);
+  bot.command('records', replyUpcoming);
+  bot.hears(MENU_TODAY, replyToday);
+  bot.hears(MENU_UPCOMING, replyUpcoming);
 }
 
 bot.command('list', replyProductList);
@@ -449,13 +687,21 @@ bot.action('undo', async (ctx) => {
 // --- Входящие сообщения ---
 
 async function handleFreeformText(ctx, text) {
+  // В салоне сообщение сначала проверяем на запись: «запиши Азамата на 15:00» —
+  // это клиент, а не приход товара. Если про запись речи нет, разбираем как
+  // раньше: у салона тот же каталог, только в нём услуги и цены.
+  if (SALON_MODE && (await handleOwnerBooking(ctx, text))) return;
+
   const catalog = await getProductNames();
   const actions = await parseStockMessage(text, catalog);
   await applyActionsAndReply(
     ctx,
     actions,
-    'Не смог понять, что нужно сделать. Попробуйте, например: «приехало 10 пачек сухарей» ' +
-      'или нажмите «ℹ️ Что я умею».'
+    SALON_MODE
+      ? 'Не смог понять. Для записи напишите «запиши Азамата завтра в 15:00 на стрижку», ' +
+          'для цены — «стрижка мужская 500», или нажмите «ℹ️ Что я умею».'
+      : 'Не смог понять, что нужно сделать. Попробуйте, например: «приехало 10 пачек сухарей» ' +
+          'или нажмите «ℹ️ Что я умею».'
   );
 }
 
@@ -534,4 +780,6 @@ if (require.main === module) {
   launchAdminBot();
 }
 
-module.exports = { launchAdminBot };
+// renderToday/renderUpcoming наружу — это готовые экраны записей, их удобно
+// проверять отдельно от Telegram и переиспользовать в сводках.
+module.exports = { launchAdminBot, renderToday, renderUpcoming };
