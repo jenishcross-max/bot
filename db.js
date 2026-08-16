@@ -4,7 +4,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 const LOW_STOCK_THRESHOLD = Number(process.env.LOW_STOCK_THRESHOLD || 5);
 
-async function addProduct({ name, price, description, photoUrl, category, quantity }) {
+async function addProduct({ name, price, description, photoUrl, category, quantity, inStock }) {
   const qty = Math.max(0, Number(quantity) || 0);
   const { data, error } = await supabase
     .from('products')
@@ -15,7 +15,9 @@ async function addProduct({ name, price, description, photoUrl, category, quanti
       photo_url: photoUrl,
       category,
       quantity: qty,
-      in_stock: qty > 0,
+      // У услуги остатка нет, а «нет в наличии» скрыло бы её от клиента: поиск
+      // по каталогу отдаёт только in_stock. Поэтому наличие можно задать явно.
+      in_stock: inStock === undefined ? qty > 0 : Boolean(inStock),
     })
     .select()
     .single();
@@ -260,6 +262,44 @@ async function applyStockAction(action) {
   return { action: 'ignored', name };
 }
 
+/* ---------------- услуги салона ----------------
+   Лежат в той же таблице products. Отличие от товара одно: остатка у услуги нет,
+   но клиенту она видна всегда. */
+
+// Добавляет услугу или обновляет цену существующей. Совпадение ищем точное (без
+// учёта регистра), а не по основе слова: «стрижка» и «стрижка детская» — разные
+// услуги, и цену второй нельзя записывать в первую.
+async function saveService({ name, price }) {
+  const clean = String(name || '').trim();
+  if (!clean) throw new Error('Не указано название услуги');
+
+  const existing = await findByIlike(sanitizeForIlike(clean));
+  if (existing) {
+    const patch = { in_stock: true };
+    if (price !== undefined && price !== null && !Number.isNaN(Number(price))) {
+      patch.price = Number(price);
+    }
+    const updated = await updateProductById(existing.id, patch);
+    return { service: updated, created: false, before: existing };
+  }
+
+  const created = await addProduct({ name: clean, price: price ?? null, quantity: 0, inStock: true });
+  return { service: created, created: true };
+}
+
+// Открывает клиентам услуги, скрытые пометкой «нет в наличии» — обычно это те,
+// что заводились когда-то как товар с нулевым остатком. Только для салона:
+// в магазине «нет в наличии» означает ровно то, что написано.
+async function publishServices() {
+  const { data, error } = await supabase
+    .from('products')
+    .update({ in_stock: true })
+    .eq('in_stock', false)
+    .select();
+  if (error) throw error;
+  return data;
+}
+
 /* ---------------- записи клиентов (режим салона) ---------------- */
 
 // Активная запись — та, которую ещё не отменили и по которой клиент не пришёл.
@@ -369,6 +409,8 @@ module.exports = {
   deleteProduct,
   getProduct,
   getProductNames,
+  saveService,
+  publishServices,
   searchProducts,
   findProductByName,
   applyStockAction,

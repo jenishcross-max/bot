@@ -144,6 +144,26 @@ function addDays(date, days) {
   return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
+// Минуты от полуночи по часам салона — в них удобно считать сетку дня.
+function localMinutes(date) {
+  const p = localParts(date);
+  return p.hour * 60 + p.minute;
+}
+
+// Обратно: день + минуты от полуночи -> момент времени.
+function atLocalTime(day, minutes) {
+  const p = localParts(day);
+  const h = Math.floor(minutes / 60);
+  return localIsoToDate(`${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(h)}:${pad(minutes % 60)}`);
+}
+
+// Сколько суток между сегодня и днём (по местным датам, а не по 24 часам).
+function dayOffset(day, now = new Date()) {
+  const a = localDayRange(now).from.getTime();
+  const b = localDayRange(day).from.getTime();
+  return Math.round((b - a) / (24 * 60 * 60 * 1000));
+}
+
 const WEEKDAY_PATTERNS = [
   [/воскресень/i, 0],
   [/понедельник/i, 1],
@@ -175,6 +195,72 @@ function dayFromText(text, now = new Date()) {
   return null;
 }
 
+/* ---------------- мастера ----------------
+   Имя мастера приходит из живой речи: «к Динаре», «запиши к Азамату», «у Айгуль».
+   Сравнение строка-в-строку такое имя не узнаёт, и мастер молча терялся — запись
+   создавалась «без мастера», хотя владелец его назвал. */
+
+function masterKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[^a-zа-я]/g, '');
+}
+
+// Слова, которые стоят рядом с именем и именем не являются. Без них «к Динаре»
+// склеивается в «кдинаре» и не совпадает ни с чем.
+const NOT_A_NAME = new Set([
+  'к', 'ко', 'у', 'на', 'до', 'от', 'с', 'со', 'в', 'во', 'для', 'же', 'бы',
+  'мастер', 'мастеру', 'мастера', 'мастером', 'мастерша',
+]);
+
+function masterTokens(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .split(/[^a-zа-я]+/)
+    .filter((t) => t.length > 1 && !NOT_A_NAME.has(t));
+}
+
+// Русское окончание — это чаще всего один последний гласный или мягкий знак:
+// «Динара»/«Динаре» -> «динар», «Азамату» -> «азамат».
+function masterStem(name) {
+  const key = masterKey(name);
+  return key.length > 4 && /[аеиоуыэюяьй]$/.test(key) ? key.slice(0, -1) : key;
+}
+
+// Ищет мастера из списка салона по имени в любой форме. Возвращает имя так, как
+// оно записано в настройках, — в базе должно лежать одно написание, иначе один
+// мастер превратится в трёх («Динара», «Динаре», «динара»).
+function matchMaster(name, masters = MASTERS) {
+  const tokens = masterTokens(name);
+  if (tokens.length === 0) return null;
+
+  // Сначала точное совпадение по любому слову: если имя названо как есть, оно
+  // должно выиграть у похожего по основе соседа (Мария рядом с Мариной).
+  for (const token of tokens) {
+    const exact = masters.find((m) => masterKey(m) === token);
+    if (exact) return exact;
+  }
+
+  for (const token of tokens) {
+    const stem = masterStem(token);
+    const byStem = masters.find((m) => masterStem(m) === stem);
+    if (byStem) return byStem;
+
+    // «Азаматом», «Айгулькой» — окончание длиннее одной буквы. Такое принимаем
+    // только у длинных имён: у коротких так недолго спутать Марию с Мариной.
+    const byPrefix = masters.find((m) => {
+      const other = masterStem(m);
+      const [short, long] = other.length < stem.length ? [other, stem] : [stem, other];
+      return short.length >= 5 && long.length - short.length <= 2 && long.startsWith(short);
+    });
+    if (byPrefix) return byPrefix;
+  }
+
+  return null;
+}
+
 /* ---------------- свободные окошки ----------------
    Клиент спрашивает «а когда у вас свободно?» чаще, чем называет время сам.
    Раньше на такой вопрос отвечала модель — то есть выдумывала часы, которых
@@ -184,11 +270,9 @@ function dayFromText(text, now = new Date()) {
 // Сетка времени салона на конкретный день: 09:00, 10:00, ... до закрытия.
 // Последнее окошко должно успеть закончиться до закрытия, поэтому и «+ шаг».
 function daySlots(day) {
-  const p = localParts(day);
   const out = [];
   for (let m = WORK_HOURS.open; m + SLOT_MINUTES <= WORK_HOURS.close; m += SLOT_MINUTES) {
-    const iso = `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(Math.floor(m / 60))}:${pad(m % 60)}`;
-    const at = localIsoToDate(iso);
+    const at = atLocalTime(day, m);
     if (at) out.push(at);
   }
   return out;
@@ -231,12 +315,15 @@ function freeSlots(day, busy = [], { now = new Date(), masters = MASTERS } = {})
     .filter((s) => s.free);
 }
 
-// Строки списка. Мастера подписываем только там, где свободны не все:
+// Строки списка. Клиенту мастеров подписываем только там, где свободны не все:
 // «11:00 — Динара, Айгуль» рядом с «11:00» ничего не добавляет, а читать мешает.
-function slotLines(slots, { masters = MASTERS, limit = 8 } = {}) {
+// Владельцу наоборот — ему важно видеть, кто именно свободен, поэтому в админке
+// вызываем с withMasters.
+function slotLines(slots, { masters = MASTERS, limit = 8, withMasters = false } = {}) {
   return slots.slice(0, limit).map((s) => {
     const time = formatTime(s.at);
-    if (masters.length === 0 || s.masters.length === masters.length) return time;
+    if (masters.length === 0) return time;
+    if (!withMasters && s.masters.length === masters.length) return time;
     return `${time} — ${s.masters.join(', ')}`;
   });
 }
@@ -398,7 +485,11 @@ async function parseBookingRequest(text, { services = [], history = [], now = ne
   const parsed = extractJson(completion.choices[0]?.message?.content || '{}');
   if (!parsed) return null;
 
-  const master = MASTERS.find((m) => m.toLowerCase() === String(parsed.master || '').toLowerCase());
+  // Мастера ищем по списку салона, но и незнакомое имя не выбрасываем: если
+  // мастера в настройках не заведены вовсе, «к Азамату» — единственный способ
+  // узнать, кто ведёт запись, и терять его нельзя.
+  const masterRaw = parsed.master ? String(parsed.master).trim().slice(0, 40) : null;
+  const master = matchMaster(masterRaw);
 
   // Час берём только тогда, когда клиент его действительно назвал. Иначе это
   // день без времени: его и возвращаем отдельно, чтобы переспросить «во сколько?»,
@@ -410,7 +501,10 @@ async function parseBookingRequest(text, { services = [], history = [], now = ne
     intent: ['book', 'cancel', 'check', 'slots'].includes(parsed.intent) ? parsed.intent : 'none',
     clientName: parsed.client_name ? String(parsed.client_name).trim().slice(0, 60) : null,
     service: parsed.service ? String(parsed.service).trim().slice(0, 80) : null,
-    master: master || null,
+    master: master || (MASTERS.length === 0 ? masterRaw : null),
+    // Имя названо, но такого мастера в салоне нет — об этом лучше сказать вслух,
+    // чем тихо записать клиента к кому попало.
+    unknownMaster: masterRaw && !master && MASTERS.length > 0 ? masterRaw : null,
     when: timed ? at : null,
     day: at && !timed ? at : null,
     note: parsed.note ? String(parsed.note).trim().slice(0, 200) : null,
@@ -430,6 +524,10 @@ module.exports = {
   localDayRange,
   sameLocalDay,
   addDays,
+  dayOffset,
+  localMinutes,
+  atLocalTime,
+  matchMaster,
   dayFromText,
   formatTime,
   formatDay,

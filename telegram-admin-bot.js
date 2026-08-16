@@ -11,6 +11,8 @@ const {
   applyStockAction,
   restoreProduct,
   getStockSummary,
+  saveService,
+  publishServices,
   createAppointment,
   listAppointments,
   getAppointment,
@@ -59,12 +61,18 @@ const MENU_TODAY = '📅 Записи на сегодня';
 const MENU_UPCOMING = '🗓 Все записи';
 const MENU_SLOTS = '🕒 Свободные окошки';
 const MENU_BOOK = '✍️ Записать клиента';
+const MENU_MASTERS = '👤 Мастера';
+
+const MENU_BUTTONS = new Set([
+  MENU_ADD, MENU_BULK, MENU_LIST, MENU_STATS, MENU_HELP,
+  MENU_TODAY, MENU_UPCOMING, MENU_SLOTS, MENU_BOOK, MENU_MASTERS,
+]);
 
 const mainMenu = SALON_MODE
   ? Markup.keyboard([
       [MENU_TODAY, MENU_UPCOMING],
       [MENU_SLOTS, MENU_BOOK],
-      [MENU_LIST, MENU_ADD],
+      [MENU_MASTERS, MENU_LIST],
       [MENU_HELP],
     ]).resize()
   : Markup.keyboard([
@@ -266,66 +274,104 @@ async function voiceToText(ctx) {
   return transcribeVoice(buffer);
 }
 
-// --- Запись клиента владельцем (режим салона) ---
+// --- Добавление услуги (режим салона) ---
 //
-// Клиент позвонил или пришёл с улицы — запись всё равно должна попасть в общий
-// список, иначе бот в WhatsApp предложит это время второму человеку.
-const bookClientWizard = new Scenes.WizardScene(
-  'book-client',
+// У услуги есть только название и цена. Спрашивать про неё «сколько штук в
+// наличии» и «пришлите фото» — это мастер добавления товара, и он же превращал
+// стрижку в складскую позицию «1 шт.».
+const addServiceWizard = new Scenes.WizardScene(
+  'add-service',
   async (ctx) => {
     await ctx.reply(
-      'Кого записать? Напишите одной строкой или наговорите голосом:\n\n' +
-        '• «Азамат, стрижка, завтра в 15:00»\n' +
-        '• «Нурия, окрашивание, в субботу в 11 к Динаре»\n\n' +
+      'Название услуги? (можно сразу с ценой: «Стрижка мужская; 500»)\n' +
         'Отправьте «-» чтобы отменить.',
       Markup.removeKeyboard()
     );
     return ctx.wizard.next();
   },
   async (ctx) => {
-    let text = (ctx.message?.text || '').trim();
-    if (!text) {
-      text = (await voiceToText(ctx)) || '';
-      if (text) await ctx.reply(`🎤 Распознал: «${text}»`);
-    }
-
-    if (!text || text === SKIP) {
+    const raw = (ctx.message?.text || '').trim();
+    if (!raw || raw === SKIP) {
       await ctx.reply('Отменено.', mainMenu);
       return ctx.scene.leave();
     }
 
-    // Разбираем тем же кодом, что и свободный текст: две дороги к одной записи
-    // рано или поздно разъезжаются в поведении, а чинить приходится обе.
-    const booked = await handleOwnerBooking(ctx, text);
-    if (!booked) {
-      await ctx.reply(
-        'Не понял, кого и на когда записать. Попробуйте так: «Азамат, стрижка, завтра в 15:00».',
-        mainMenu
-      );
+    // Нажатие кнопки меню — это не название услуги. Иначе в прайсе появляется
+    // услуга «📅 Записи на сегодня», и удалять её потом руками.
+    if (MENU_BUTTONS.has(raw)) {
+      await ctx.reply('Отменил добавление услуги. Нажмите кнопку ещё раз.', mainMenu);
+      return ctx.scene.leave();
     }
+
+    const oneLine = parseServiceLine(raw);
+    if (oneLine) {
+      await ctx.reply(await saveServiceText(oneLine), mainMenu);
+      return ctx.scene.leave();
+    }
+
+    ctx.wizard.state.name = raw;
+    await ctx.reply('Цена? (число, например 500, или «-» если цена договорная)');
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const raw = (ctx.message?.text || '').trim();
+    const price = raw === SKIP ? null : Number(raw.replace(',', '.').replace(/[^\d.]/g, ''));
+    if (raw !== SKIP && !Number.isFinite(price)) {
+      await ctx.reply('Не похоже на число. Введите цену ещё раз или отправьте «-»:');
+      return;
+    }
+
+    await ctx.reply(await saveServiceText({ name: ctx.wizard.state.name, price }), mainMenu);
     return ctx.scene.leave();
   }
 );
 
-const stage = new Scenes.Stage([addProductWizard, bulkAddWizard, bookClientWizard]);
+// «Стрижка мужская; 500» -> {name, price}. Разделитель обязателен: без него
+// строка неотличима от записи клиента, а спутать их нельзя.
+function parseServiceLine(raw) {
+  const parts = String(raw || '').split(/[;|]/).map((s) => s.trim());
+  if (parts.length < 2 || !parts[0]) return null;
+  const price = Number(parts[1].replace(',', '.').replace(/[^\d.]/g, ''));
+  if (!parts[1] || !Number.isFinite(price)) return null;
+  return { name: parts[0], price };
+}
+
+async function saveServiceText({ name, price }) {
+  try {
+    const { service, created } = await saveService({ name, price });
+    const priceText = service.price ?? 'цена договорная';
+    return created
+      ? `✅ Услуга добавлена: ${service.name} — ${priceText}`
+      : `✅ Цена обновлена: ${service.name} — ${priceText}`;
+  } catch (err) {
+    console.error('Не удалось сохранить услугу:', err.message);
+    return `Не удалось сохранить услугу: ${err.message}`;
+  }
+}
+
+const stage = new Scenes.Stage(
+  SALON_MODE ? [addServiceWizard] : [addProductWizard, bulkAddWizard]
+);
 bot.use(session());
 bot.use(stage.middleware());
 
 // --- Команды и меню ---
 
 const SALON_HELP_TEXT =
-  'Я веду записи салона.\n\n' +
+  'Я веду записи салона — и больше ничего: склада, остатков и «штук» здесь нет.\n\n' +
   '📅 «Записи на сегодня» — кто и во сколько придёт сегодня.\n' +
   '🗓 «Все записи» — все предстоящие, по дням.\n' +
-  '🕒 «Свободные окошки» — что осталось на день; стрелками листаются другие дни.\n' +
-  '✍️ «Записать клиента» — записать того, кто позвонил или пришёл сам.\n\n' +
+  '🕒 «Свободные окошки» — что осталось на день, с мастерами; стрелки листают дни.\n' +
+  '✍️ «Записать клиента» — пошагово: имя → мастер → услуга → день → время.\n' +
+  '👤 «Мастера» — расписание каждого мастера на день.\n' +
+  '💇 «Услуги и цены» — прайс, который видит клиент в WhatsApp.\n\n' +
   'Кнопка ✅ отмечает, что клиент пришёл, ❌ — отменяет запись.\n\n' +
-  'Записать можно и без кнопок — просто напишите или наговорите голосом:\n' +
+  'Можно и без кнопок — напишите или наговорите голосом:\n' +
   '• «запиши Азамата завтра в 15:00 на стрижку»\n' +
-  '• «Нурия, окрашивание, в субботу в 11 к Динаре»\n\n' +
-  'Услуги и цены ведутся так же, как товары:\n' +
-  '• «стрижка мужская 500» — добавить или поправить цену\n' +
-  '• «удали услугу маникюр» — убрать\n\n' +
+  '• «запись к мастеру Динаре в 11» — чего не хватит, я спрошу кнопками\n' +
+  '• «что свободно в субботу?» — покажу окошки\n' +
+  '• «отмени запись Азамата» — покажу его записи с кнопкой отмены\n\n' +
+  'Цену услуги можно прислать строкой «Стрижка мужская; 500» — добавлю или обновлю.\n\n' +
   'Когда клиент запишется через WhatsApp — я сразу пришлю сюда его имя, время и номер, ' +
   'а отметить приход можно прямо из уведомления.';
 
@@ -349,25 +395,48 @@ bot.start((ctx) =>
   ctx.reply(`${SALON_MODE ? 'Админ-бот салона' : 'Админ-бот магазина'}.\n\n${HELP_TEXT}`, mainMenu)
 );
 
-bot.command('add', (ctx) => ctx.scene.enter('add-product'));
-
 function productLine(p) {
   const head = `#${p.id} ${p.name} — ${p.price ?? '—'}${p.category ? ` [${p.category}]` : ''}`;
-  // У услуги нет остатка: «стрижка, 3 шт.» — бессмыслица.
-  if (SALON_MODE) return head;
+  // У услуги нет остатка: «стрижка, 3 шт.» — бессмыслица. Зато важно другое:
+  // клиенту в WhatsApp видны только позиции «в наличии», и услуга, заведённая
+  // когда-то как товар с нулевым остатком, для него просто не существует.
+  if (SALON_MODE) return `${head}${p.in_stock ? '' : ' ⚠️ скрыта от клиентов'}`;
   return `${head}, остаток: ${p.quantity ?? 0}${p.in_stock ? '' : ' (нет в наличии)'}`;
 }
 
 async function replyProductList(ctx) {
   const products = await listProducts({ limit: 30 });
   if (products.length === 0) {
-    await ctx.reply(`${SALON_MODE ? 'Услуг' : 'Товаров'} пока нет. Нажмите «${MENU_ADD}».`, mainMenu);
+    await ctx.reply(
+      SALON_MODE
+        ? `Услуг пока нет. Нажмите «➕ Добавить услугу» ниже или пришлите строкой: «Стрижка мужская; 500».`
+        : `Товаров пока нет. Нажмите «${MENU_ADD}».`,
+      SALON_MODE
+        ? Markup.inlineKeyboard([[Markup.button.callback('➕ Добавить услугу', 'svc_add')]])
+        : mainMenu
+    );
     return;
   }
+
+  if (SALON_MODE) {
+    const hidden = products.filter((p) => !p.in_stock).length;
+    const rows = [
+      [Markup.button.callback('➕ Добавить услугу', 'svc_add')],
+      [Markup.button.callback('🗑 Удалить услугу', 'pick_delete')],
+    ];
+    if (hidden > 0) rows.push([Markup.button.callback(`👁 Показать клиентам (${hidden})`, 'svc_publish')]);
+    await ctx.reply(
+      `💇 Услуги и цены\n\n${products.map(productLine).join('\n')}` +
+        (hidden > 0 ? '\n\n⚠️ Услуги с пометкой не показываются клиенту в WhatsApp.' : ''),
+      Markup.inlineKeyboard(rows)
+    );
+    return;
+  }
+
   await ctx.reply(
     products.map(productLine).join('\n'),
     Markup.inlineKeyboard([
-      [Markup.button.callback(SALON_MODE ? '🗑 Удалить услугу' : '🗑 Удалить товар', 'pick_delete')],
+      [Markup.button.callback('🗑 Удалить товар', 'pick_delete')],
       [Markup.button.callback('⚡ Добавить списком', 'bulk_add')],
     ])
   );
@@ -400,11 +469,14 @@ function phoneText(a) {
   return a.chat_id ? 'написал в WhatsApp' : 'номер не указан';
 }
 
+// Мастера пишем всегда, даже когда он не указан: владелец должен видеть, что
+// запись «ничья», а не гадать, забыли его вписать или мастер один на весь салон.
 function appointmentLine(a) {
   const time = salon.formatTime(new Date(a.starts_at));
-  const head = [a.client_name, a.service, a.master && `мастер ${a.master}`].filter(Boolean).join(' · ');
   const mark = a.status === 'done' ? '✔ ' : '';
-  const tail = [phoneText(a), a.note].filter(Boolean).join(' · ');
+  const head = [a.client_name, a.service].filter(Boolean).join(' · ');
+  const master = a.master ? `✂️ ${a.master}` : '✂️ мастер не указан';
+  const tail = [master, phoneText(a), a.note].filter(Boolean).join(' · ');
   return `${mark}${time}  ${head}\n         ${tail}`;
 }
 
@@ -481,7 +553,8 @@ async function renderSlots(offset = 0) {
   if (offset < SLOTS_MAX_OFFSET) {
     nav.push(Markup.button.callback('следующий день →', `slots:${offset + 1}`));
   }
-  const keyboard = Markup.inlineKeyboard([nav]);
+  const rows = [nav, [Markup.button.callback('✍️ Записать клиента', `bk_start:${offset}`)]];
+  const keyboard = Markup.inlineKeyboard(rows);
 
   const head = `🕒 Свободно ${salon.dayLabel(day)}\n${salon.formatDay(day)}`;
   if (slots.length === 0) {
@@ -494,7 +567,9 @@ async function renderSlots(offset = 0) {
   return {
     text:
       `${head}\n\n` +
-      salon.slotLines(slots, { limit: 24 }).join('\n') +
+      // Владельцу мастеров подписываем всегда: «14:00» без имени он читает как
+      // «свободны все», а там может быть занят как раз тот, кого просит клиент.
+      salon.slotLines(slots, { limit: 24, withMasters: true }).join('\n') +
       `\n\nВсего свободно: ${slots.length}.`,
     keyboard,
   };
@@ -502,6 +577,88 @@ async function renderSlots(offset = 0) {
 
 async function replySlots(ctx) {
   const { text, keyboard } = await renderSlots(0);
+  await ctx.reply(text, keyboard);
+}
+
+/* ---------------- мастера ----------------
+   Отдельный экран: у владельца салона вопрос обычно не «что свободно вообще»,
+   а «что у Динары» — она одна ведёт окрашивание, и её день расписан иначе. */
+
+const MASTERS_MAX_OFFSET = 14;
+const NO_MASTER = 'без мастера';
+
+// Записи дня, разложенные по мастерам. Записи без мастера попадают в отдельную
+// группу: потерять их нельзя, они тоже занимают кресло.
+function groupByMaster(list) {
+  const groups = new Map(salon.MASTERS.map((m) => [m, []]));
+  for (const a of list) {
+    const key = a.master && groups.has(a.master) ? a.master : a.master || NO_MASTER;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(a);
+  }
+  return groups;
+}
+
+async function renderMasters(offset = 0) {
+  const day = salon.addDays(new Date(), offset);
+  const { from, to } = salon.localDayRange(day);
+  const all = await listAppointments({ from, to, status: null, limit: 200 });
+  const list = all.filter((a) => a.status !== 'cancelled');
+  const active = list.filter((a) => a.status === 'active');
+
+  const nav = [];
+  if (offset > 0) nav.push(Markup.button.callback('← назад', `masters:${offset - 1}`));
+  if (offset < MASTERS_MAX_OFFSET) {
+    nav.push(Markup.button.callback('следующий день →', `masters:${offset + 1}`));
+  }
+  const keyboard = Markup.inlineKeyboard([nav, [Markup.button.callback('✍️ Записать клиента', `bk_start:${offset}`)]]);
+  const head = `👤 Мастера · ${salon.dayLabel(day)}\n${salon.formatDay(day)}`;
+
+  // Мастера не заведены — салон считается «в одно кресло». Это рабочий режим, но
+  // владелец должен понимать, почему бот не спрашивает мастера и почему второй
+  // клиент на то же время получает отказ.
+  if (salon.MASTERS.length === 0) {
+    const seen = [...new Set(list.map((a) => a.master).filter(Boolean))];
+    return {
+      text:
+        `${head}\n\nМастера не заданы — салон считается «в одно кресло»: ` +
+        'любая запись занимает время целиком.\n\n' +
+        'Чтобы бот вёл расписание по мастерам и предлагал «свободна Динара», ' +
+        'впишите их в настройку SALON_MASTERS через запятую (например: Айгуль,Динара) ' +
+        'и перезапустите сервис.' +
+        (seen.length > 0 ? `\n\nВ записях этого дня встречаются: ${seen.join(', ')}.` : ''),
+      keyboard,
+    };
+  }
+
+  const groups = groupByMaster(list);
+  const blocks = [];
+  for (const [master, items] of groups) {
+    const own = master === NO_MASTER ? [] : salon.freeSlots(day, active, { masters: [master] });
+    const lines = items.map((a) => {
+      const mark = a.status === 'done' ? '✔ ' : '';
+      const what = [a.client_name, a.service].filter(Boolean).join(' · ');
+      return `   ${mark}${salon.formatTime(new Date(a.starts_at))}  ${what}`;
+    });
+
+    if (master === NO_MASTER) {
+      blocks.push(`❓ Без мастера\n${lines.join('\n')}`);
+      continue;
+    }
+
+    const free = own.map((s) => salon.formatTime(s.at));
+    blocks.push(
+      `✂️ ${master}\n` +
+        (lines.length > 0 ? `${lines.join('\n')}\n` : '   записей нет\n') +
+        (free.length > 0 ? `   свободно: ${free.slice(0, 12).join(', ')}` : '   свободных окошек нет')
+    );
+  }
+
+  return { text: `${head}\n\n${blocks.join('\n\n')}`, keyboard };
+}
+
+async function replyMasters(ctx) {
+  const { text, keyboard } = await renderMasters(0);
   await ctx.reply(text, keyboard);
 }
 
@@ -564,30 +721,516 @@ if (SALON_MODE) {
     );
   });
 
-  // Запись поверх занятого времени — только по явному подтверждению владельца.
-  bot.action('force_book', async (ctx) => {
-    await ctx.answerCbQuery();
-    const draft = ctx.session?.forcedBooking;
-    if (!draft) {
-      await ctx.editMessageText('Запись уже неактуальна — напишите её заново.');
-      return;
-    }
-    ctx.session.forcedBooking = null;
-    const appointment = await createAppointment({ ...draft, source: 'telegram' });
-    await ctx.editMessageText(bookedText(appointment));
-  });
-
   bot.action(/^slots:(\d+)$/, async (ctx) => {
     const offset = Math.min(Number(ctx.match[1]), SLOTS_MAX_OFFSET);
     const { text, keyboard } = await renderSlots(offset);
     await ctx.answerCbQuery();
     await ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard));
   });
+
+  bot.action(/^masters:(\d+)$/, async (ctx) => {
+    const offset = Math.min(Number(ctx.match[1]), MASTERS_MAX_OFFSET);
+    const { text, keyboard } = await renderMasters(offset);
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(text, keyboard).catch(() => ctx.reply(text, keyboard));
+  });
+
+  // --- шаги записи ---
+
+  bot.action(/^bk_start:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const offset = Math.min(Number(ctx.match[1]), SLOTS_MAX_OFFSET);
+    await startBooking(ctx, { day: salon.addDays(new Date(), offset) });
+  });
+
+  bot.action(/^bk_m:(-?\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = draftOf(ctx);
+    if (!draft) return staleDraft(ctx);
+    const index = Number(ctx.match[1]);
+    // Время, если оно уже названо, оставляем как есть: занятость мастера всё
+    // равно проверяется перед сохранением, и терять сказанное владельцем незачем.
+    draft.master = index >= 0 ? salon.MASTERS[index] || null : null;
+    await askNext(ctx, true);
+  });
+
+  bot.action(/^bk_s:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = draftOf(ctx);
+    if (!draft) return staleDraft(ctx);
+    const id = Number(ctx.match[1]);
+    const picked = (draft.serviceChoices || []).find((s) => s.id === id);
+    draft.service = picked ? picked.name : null;
+    await askNext(ctx, true);
+  });
+
+  bot.action(/^bk_d:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = draftOf(ctx);
+    if (!draft) return staleDraft(ctx);
+    draft.day = salon.addDays(new Date(), Math.min(Number(ctx.match[1]), BOOK_DAYS_AHEAD));
+    draft.when = undefined;
+    await askNext(ctx, true);
+  });
+
+  bot.action(/^bk_t:(\d+|manual)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = draftOf(ctx);
+    if (!draft) return staleDraft(ctx);
+
+    if (ctx.match[1] === 'manual') {
+      draft.awaiting = 'time';
+      await show(ctx, true, `${draftHead(draft)}Во сколько записать? Напишите время, например 15:30.`, [
+        [Markup.button.callback('← К списку окошек', 'bk_back_time')],
+        cancelRow(),
+      ]);
+      return;
+    }
+
+    draft.when = salon.atLocalTime(draft.day || new Date(), Number(ctx.match[1]));
+    await askNext(ctx, true);
+  });
+
+  bot.action('bk_back_day', async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = draftOf(ctx);
+    if (!draft) return staleDraft(ctx);
+    draft.day = undefined;
+    draft.when = undefined;
+    await askNext(ctx, true);
+  });
+
+  bot.action('bk_back_time', async (ctx) => {
+    await ctx.answerCbQuery();
+    const draft = draftOf(ctx);
+    if (!draft) return staleDraft(ctx);
+    draft.when = undefined;
+    await askNext(ctx, true);
+  });
+
+  bot.action('bk_save', async (ctx) => {
+    await ctx.answerCbQuery();
+    await saveDraft(ctx);
+  });
+
+  // Запись поверх занятого времени — только по явному подтверждению владельца.
+  bot.action('bk_force', async (ctx) => {
+    await ctx.answerCbQuery();
+    await saveDraft(ctx, { force: true });
+  });
+
+  bot.action('bk_cancel', async (ctx) => {
+    await ctx.answerCbQuery();
+    sessionOf(ctx).booking = null;
+    await show(ctx, true, 'Отменил — ничего не записал.');
+  });
+
+  bot.action('svc_add', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.scene.enter('add-service');
+  });
+
+  bot.action('svc_publish', async (ctx) => {
+    await ctx.answerCbQuery();
+    try {
+      const published = await publishServices();
+      await ctx.editMessageText(
+        published.length > 0
+          ? `👁 Теперь клиенты видят: ${published.map((p) => p.name).join(', ')}`
+          : 'Все услуги и так видны клиентам.'
+      );
+    } catch (err) {
+      console.error('Не удалось показать услуги клиентам:', err.message);
+      await ctx.reply(`Не удалось: ${err.message}`);
+    }
+  });
 }
 
-// Владелец записывает клиента сам — он принял звонок, пока бот спал.
-// Возвращает true, если сообщение было про запись и обработано здесь.
-async function handleOwnerBooking(ctx, text) {
+/* ---------------- пошаговая запись клиента ----------------
+
+   Запись — это четыре вещи: кто, к кому, на что и когда. Свободный текст даёт
+   их не всегда: во фразе «запись к мастеру Азамату в 15:00» нет имени клиента,
+   а бот раньше на этом останавливался и просил переписать всё заново. Теперь
+   недостающее он спрашивает кнопками, а время предлагает только свободное —
+   промахнуться мимо занятого окошка попросту нечем.
+
+   Черновик живёт в сессии владельца: одновременно он ведёт одну запись. */
+
+const BOOK_DAYS_AHEAD = 6;
+
+function sessionOf(ctx) {
+  if (!ctx.session) ctx.session = {};
+  return ctx.session;
+}
+
+function draftOf(ctx) {
+  return sessionOf(ctx).booking || null;
+}
+
+function cancelRow() {
+  return [Markup.button.callback('✖️ Отмена', 'bk_cancel')];
+}
+
+function chunk(items, size) {
+  const rows = [];
+  for (let i = 0; i < items.length; i += size) rows.push(items.slice(i, i + size));
+  return rows;
+}
+
+// Шаги идут по одному сообщению: нажатие правит его же, а не сыплет в чат
+// десяток экранов. На текстовый ответ приходится отвечать новым сообщением —
+// старое уже уехало вверх.
+async function show(ctx, edit, text, rows) {
+  const keyboard = rows && rows.length > 0 ? Markup.inlineKeyboard(rows) : undefined;
+  if (edit) {
+    const edited = await ctx
+      .editMessageText(text, keyboard)
+      .then(() => true)
+      .catch(() => false);
+    if (edited) return;
+  }
+  await ctx.reply(text, keyboard);
+}
+
+async function staleDraft(ctx) {
+  sessionOf(ctx).booking = null;
+  await show(ctx, true, 'Эта запись уже неактуальна — начните заново кнопкой «✍️ Записать клиента».');
+}
+
+// Что уже выбрано — показываем над каждым вопросом, иначе на четвёртом шаге
+// владелец не помнит, кого записывает.
+function draftHead(d) {
+  const parts = [];
+  if (d.clientName) parts.push(`👤 ${d.clientName}`);
+  if (d.master) parts.push(`✂️ ${d.master}`);
+  else if (d.master === null && salon.MASTERS.length > 0) parts.push('✂️ любой мастер');
+  if (d.service) parts.push(`💇 ${d.service}`);
+  if (d.when) parts.push(`🕒 ${salon.formatWhen(new Date(d.when))}`);
+  else if (d.day) parts.push(`📅 ${salon.formatDay(new Date(d.day))}`);
+  return parts.length > 0 ? `${parts.join('\n')}\n\n` : '';
+}
+
+async function startBooking(ctx, prefill = {}, edit = false) {
+  sessionOf(ctx).booking = {
+    clientName: undefined,
+    master: undefined,
+    service: undefined,
+    day: undefined,
+    when: undefined,
+    note: null,
+    awaiting: null,
+    ...prefill,
+  };
+  return askNext(ctx, edit);
+}
+
+// Спрашиваем первое, чего не хватает. Порядок один и тот же, откуда бы запись
+// ни началась — с кнопки, с фразы владельца или с экрана свободных окошек.
+async function askNext(ctx, edit = false) {
+  const d = draftOf(ctx);
+  if (!d) return staleDraft(ctx);
+  d.awaiting = null;
+
+  if (!d.clientName) return askName(ctx, edit);
+  if (salon.MASTERS.length > 0 && d.master === undefined) return askMaster(ctx, edit);
+  if (d.service === undefined) return askService(ctx, edit);
+  if (!d.when) return d.day ? askTime(ctx, edit) : askDay(ctx, edit);
+  return askConfirm(ctx, edit);
+}
+
+async function askName(ctx, edit) {
+  const d = draftOf(ctx);
+  d.awaiting = 'name';
+  await show(ctx, edit, `${draftHead(d)}Как зовут клиента? Напишите имя или наговорите голосом.`, [
+    cancelRow(),
+  ]);
+}
+
+async function askMaster(ctx, edit) {
+  const d = draftOf(ctx);
+  const rows = chunk(
+    salon.MASTERS.map((m, i) => Markup.button.callback(m, `bk_m:${i}`)),
+    2
+  );
+  rows.push([Markup.button.callback('Любой мастер', 'bk_m:-1')]);
+  rows.push(cancelRow());
+  await show(ctx, edit, `${draftHead(d)}К какому мастеру?`, rows);
+}
+
+async function askService(ctx, edit) {
+  const d = draftOf(ctx);
+
+  let services = [];
+  try {
+    services = await listProducts({ limit: 12 });
+  } catch (err) {
+    console.error('Не удалось получить список услуг:', err.message);
+  }
+
+  // Прайс не заведён — не мучаем владельца пустым экраном, услугу можно вписать
+  // потом или не указывать вовсе.
+  if (services.length === 0) {
+    d.service = null;
+    return askNext(ctx, edit);
+  }
+
+  d.serviceChoices = services.map((p) => ({ id: p.id, name: p.name }));
+  const rows = services.map((p) => [
+    Markup.button.callback(
+      `${p.name}${p.price != null ? ` — ${p.price}` : ''}`.slice(0, 60),
+      `bk_s:${p.id}`
+    ),
+  ]);
+  rows.push([Markup.button.callback('Без услуги', 'bk_s:0')]);
+  rows.push(cancelRow());
+  await show(ctx, edit, `${draftHead(d)}Какая услуга?`, rows);
+}
+
+async function askDay(ctx, edit) {
+  const d = draftOf(ctx);
+  const buttons = [];
+  for (let i = 0; i <= BOOK_DAYS_AHEAD; i += 1) {
+    const day = salon.addDays(new Date(), i);
+    const label = i === 0 ? 'сегодня' : i === 1 ? 'завтра' : salon.dayLabel(day);
+    buttons.push(Markup.button.callback(label, `bk_d:${i}`));
+  }
+  const rows = chunk(buttons, 2);
+  rows.push(cancelRow());
+  await show(ctx, edit, `${draftHead(d)}На какой день записать?`, rows);
+}
+
+// Свободное время дня для выбранного мастера. Тот же расчёт, что и у бота в
+// WhatsApp: разойдись они — владелец пообещает по телефону время, которое бот
+// в этот момент уже отдал другому.
+async function freeSlotsFor(day, master) {
+  const { from, to } = salon.localDayRange(day);
+  const busy = await listAppointments({ from, to, status: 'active', limit: 200 });
+  const slots = salon.freeSlots(day, busy);
+  if (!master || salon.MASTERS.length === 0) return slots;
+  return slots.filter((s) => s.masters.includes(master));
+}
+
+async function askTime(ctx, edit) {
+  const d = draftOf(ctx);
+  const day = new Date(d.day);
+
+  let slots = [];
+  try {
+    slots = await freeSlotsFor(day, d.master);
+  } catch (err) {
+    console.error('Не удалось получить свободные окошки:', err.message);
+  }
+
+  const rows = chunk(
+    slots
+      .slice(0, 24)
+      .map((s) => Markup.button.callback(salon.formatTime(s.at), `bk_t:${salon.localMinutes(s.at)}`)),
+    4
+  );
+  rows.push([Markup.button.callback('🕓 Другое время', 'bk_t:manual')]);
+  rows.push([Markup.button.callback('← Другой день', 'bk_back_day')]);
+  rows.push(cancelRow());
+
+  const who = d.master ? ` у мастера ${d.master}` : '';
+  const text =
+    slots.length > 0
+      ? `${draftHead(d)}Во сколько? Свободно${who} ${salon.dayLabel(day)}:`
+      : `${draftHead(d)}Свободных окошек${who} ${salon.dayLabel(day)} нет.\n` +
+        'Возьмите другой день — или впишите время вручную, тогда запишу поверх.';
+
+  await show(ctx, edit, text, rows);
+}
+
+async function askConfirm(ctx, edit) {
+  const d = draftOf(ctx);
+  await show(ctx, edit, `Проверьте запись:\n\n${draftHead(d).trim()}\n\nВсё верно?`, [
+    [Markup.button.callback('✅ Записать', 'bk_save')],
+    [Markup.button.callback('← Другое время', 'bk_back_time')],
+    cancelRow(),
+  ]);
+}
+
+// Не «занято — до свидания», а предупреждение с правом записать всё равно:
+// владелец видит зал и знает, поместится ли ещё один клиент.
+async function bookingConflict(d) {
+  let avail;
+  try {
+    const { from, to } = salon.localDayRange(d.when);
+    const dayBusy = await listAppointments({ from, to, status: 'active', limit: 200 });
+    avail = salon.availabilityAt(d.when, dayBusy);
+  } catch (err) {
+    // База молчит — мешать владельцу записывать мы точно не станем.
+    console.error('Не удалось проверить занятость:', err.message);
+    return null;
+  }
+
+  const masterBusy = Boolean(
+    d.master && salon.MASTERS.length > 0 && !avail.masters.includes(d.master)
+  );
+  if (avail.free && !masterBusy) return null;
+
+  const taken = (d.master && avail.taken.find((a) => a.master === d.master)) || avail.taken[0];
+  return {
+    text:
+      `⚠️ На это время уже есть запись${taken ? `: ${taken.client_name}` : ''}` +
+      `${taken && taken.master ? ` к мастеру ${taken.master}` : ''}.\n` +
+      (avail.free && avail.masters.length > 0 ? `Свободны: ${avail.masters.join(', ')}.\n` : '') +
+      '\nЗаписать всё равно?',
+    rows: [
+      [Markup.button.callback('✅ Да, записать', 'bk_force')],
+      [Markup.button.callback('← Другое время', 'bk_back_time')],
+      cancelRow(),
+    ],
+  };
+}
+
+async function saveDraft(ctx, { force = false } = {}) {
+  const d = draftOf(ctx);
+  if (!d || !d.when || !d.clientName) return staleDraft(ctx);
+
+  const check = salon.checkWhen(new Date(d.when));
+  if (!check.ok) {
+    d.when = undefined;
+    await show(ctx, true, `Не записал: ${whyNotTime(check.reason)}. Выберите другое время.`, [
+      [Markup.button.callback('🕒 Выбрать время', 'bk_back_time')],
+      cancelRow(),
+    ]);
+    return;
+  }
+
+  if (!force) {
+    const conflict = await bookingConflict(d);
+    if (conflict) {
+      await show(ctx, true, conflict.text, conflict.rows);
+      return;
+    }
+  }
+
+  try {
+    const appointment = await createAppointment({
+      clientName: d.clientName,
+      service: d.service,
+      master: d.master,
+      startsAt: d.when,
+      source: 'telegram',
+      note: d.note,
+    });
+    sessionOf(ctx).booking = null;
+    await show(ctx, true, bookedText(appointment));
+  } catch (err) {
+    console.error('Не удалось создать запись:', err.message);
+    await show(ctx, true, `Не удалось сохранить запись.\n${err.message}`);
+  }
+}
+
+function whyNotTime(reason) {
+  if (reason === 'no_clock') return 'не указано время';
+  if (reason === 'closed') return `в это время салон закрыт, работаем ${salon.workHoursText()}`;
+  if (reason === 'past') return 'это время уже прошло';
+  if (reason === 'too_far') return 'это слишком далеко от сегодняшнего дня';
+  return 'не понял время';
+}
+
+// «15:30», «в 15», «в 3» — владелец пишет цифрами, этого и хватает.
+function parseClockText(text, day) {
+  const m = /(\d{1,2})\s*(?:[:.\s]\s*(\d{2}))?/.exec(String(text || ''));
+  if (!m) return null;
+
+  let hour = Number(m[1]);
+  const minute = Number(m[2] || 0);
+  if (hour > 23 || minute > 59) return null;
+  // «в 3» в салоне означает 15:00: в три ночи никто не стрижёт.
+  if (hour * 60 < salon.WORK_HOURS.open && (hour + 12) * 60 < salon.WORK_HOURS.close) hour += 12;
+
+  return salon.atLocalTime(day, hour * 60 + minute);
+}
+
+// Текст, которого ждёт открытый шаг записи. Возвращает true, если сообщение
+// было ответом на вопрос бота, а не новой командой.
+async function handleBookingInput(ctx, text) {
+  const d = draftOf(ctx);
+  if (!d || !d.awaiting) return false;
+
+  if (d.awaiting === 'name') {
+    d.clientName = text.trim().slice(0, 60);
+    await askNext(ctx);
+    return true;
+  }
+
+  if (d.awaiting === 'time') {
+    const when = parseClockText(text, d.day || new Date());
+    if (!when) {
+      await ctx.reply('Не понял время. Напишите так: 15:30');
+      return true;
+    }
+    const check = salon.checkWhen(when);
+    if (!check.ok) {
+      await ctx.reply(`Так не получится: ${whyNotTime(check.reason)}. Напишите другое время.`);
+      return true;
+    }
+    d.when = when;
+    d.day = when;
+    await askNext(ctx);
+    return true;
+  }
+
+  return false;
+}
+
+function bookedText(a) {
+  return (
+    `✅ Записал: ${a.client_name}, ${salon.formatWhen(new Date(a.starts_at))}` +
+    `${a.service ? `\nУслуга: ${a.service}` : ''}` +
+    `\nМастер: ${a.master || 'не указан'}`
+  );
+}
+
+/* ---------------- свободный текст владельца (режим салона) ---------------- */
+
+const SALON_FALLBACK =
+  'Не понял. Я веду записи салона — склада и остатков здесь нет.\n\n' +
+  '• «запиши Азамата завтра в 15:00 на стрижку» — новая запись\n' +
+  '• «запись к мастеру Динаре в 11» — чего не хватит, спрошу кнопками\n' +
+  '• «что свободно в субботу?» — свободные окошки\n' +
+  '• «отмени запись Азамата» — покажу его записи\n' +
+  '• «Стрижка мужская; 500» — цена услуги\n\n' +
+  'Или пользуйтесь кнопками внизу.';
+
+// Записи конкретного клиента — по имени из фразы владельца.
+async function replyClientAppointments(ctx, name, intent) {
+  const list = await listAppointments({ from: new Date(), status: 'active', limit: 50 });
+  const key = (s) => String(s || '').toLowerCase();
+  const found = name
+    ? list.filter((a) => key(a.client_name).includes(key(name)) || key(name).includes(key(a.client_name)))
+    : list;
+
+  if (found.length === 0) {
+    await ctx.reply(
+      name ? `Активных записей на «${name}» не нашёл.` : 'Активных записей нет.',
+      mainMenu
+    );
+    return;
+  }
+
+  await ctx.reply(
+    (intent === 'cancel' ? 'Какую запись отменить?\n\n' : 'Нашёл записи:\n\n') +
+      found.slice(0, 10).map(appointmentLine).join('\n\n'),
+    Markup.inlineKeyboard(appointmentButtons(found))
+  );
+}
+
+async function handleSalonText(ctx, text) {
+  // Открытый шаг записи главнее разбора: владелец сейчас отвечает на вопрос.
+  if (await handleBookingInput(ctx, text)) return;
+
+  // Единственное, что здесь не про запись, — цена услуги. Разделитель обязателен
+  // именно поэтому: «Азамат стрижка 15:00» не должно превращаться в прайс.
+  const service = parseServiceLine(text);
+  if (service) {
+    await ctx.reply(await saveServiceText(service), mainMenu);
+    return;
+  }
+
   let services = [];
   try {
     services = await getProductNames();
@@ -596,127 +1239,83 @@ async function handleOwnerBooking(ctx, text) {
   }
 
   const parsed = await salon.parseBookingRequest(text, { services });
-  if (!parsed || parsed.intent !== 'book') return false;
+  const intent = parsed?.intent || 'none';
 
-  if (!parsed.when || !parsed.clientName) {
-    const missing = [
-      !parsed.clientName && 'имя клиента',
-      !parsed.when && (parsed.day ? 'время' : 'день и время'),
-    ]
-      .filter(Boolean)
-      .join(' и ');
-    await ctx.reply(
-      `Понял, что нужно записать, но не хватает: ${missing}.\n` +
-        'Напишите одной строкой, например: «запиши Азамата завтра в 15:00 на стрижку».',
-      mainMenu
-    );
-    return true;
+  if (intent === 'slots') {
+    const day = parsed.day || salon.dayFromText(text) || new Date();
+    const offset = Math.max(0, Math.min(salon.dayOffset(day), SLOTS_MAX_OFFSET));
+    const rendered = await renderSlots(offset);
+    await ctx.reply(rendered.text, rendered.keyboard);
+    return;
   }
 
-  const check = salon.checkWhen(parsed.when);
-  if (!check.ok) {
-    const why =
-      check.reason === 'no_clock'
-        ? 'не указано время'
-        : check.reason === 'closed'
-          ? `в это время салон закрыт (работаем ${salon.workHoursText()})`
-          : check.reason === 'past'
-            ? 'это время уже прошло'
-            : 'не понял время';
-    await ctx.reply(`Не записал: ${why}. Напишите другое время.`, mainMenu);
-    return true;
+  if (intent === 'cancel' || intent === 'check') {
+    await replyClientAppointments(ctx, parsed.clientName, intent);
+    return;
   }
 
-  // Занятость считаем тем же кодом, что и бот в WhatsApp: один расчёт на двоих,
-  // иначе владелец и бот начнут расходиться в том, какое время свободно.
-  const { from, to } = salon.localDayRange(parsed.when);
-  const dayBusy = await listAppointments({ from, to, status: 'active', limit: 200 });
-  const avail = salon.availabilityAt(parsed.when, dayBusy);
-  const conflict = parsed.master
-    ? avail.taken.find((a) => a.master === parsed.master) || avail.taken[0]
-    : avail.taken[0];
-  const masterBusy = Boolean(
-    parsed.master && salon.MASTERS.length > 0 && !avail.masters.includes(parsed.master)
-  );
-
-  if (!avail.free || masterBusy) {
-    // Владелец главнее расписания: он видит зал и знает, поместится ли ещё один
-    // клиент (мама с ребёнком, второе кресло, «сушка пока красится»). Поэтому не
-    // отказываем, а предупреждаем и даём записать всё равно.
-    ctx.session.forcedBooking = {
-      clientName: parsed.clientName,
-      service: parsed.service,
-      master: parsed.master,
-      startsAt: new Date(parsed.when).toISOString(),
-      note: parsed.note,
-    };
-    await ctx.reply(
-      `⚠️ На это время уже есть запись${conflict ? `: ${conflict.client_name}` : ''}` +
-        `${conflict && conflict.master ? ` к мастеру ${conflict.master}` : ''}.\n` +
-        (avail.free ? `Свободны: ${avail.masters.join(', ')}.\n` : '') +
-        'Записать всё равно?',
-      Markup.inlineKeyboard([
-        [
-          Markup.button.callback('✅ Да, записать', 'force_book'),
-          Markup.button.callback('← Нет', 'cancel'),
-        ],
-      ])
-    );
-    return true;
+  if (intent === 'book') {
+    if (parsed.unknownMaster) {
+      await ctx.reply(
+        `Мастера «${parsed.unknownMaster}» в списке нет — сейчас в салоне: ${salon.MASTERS.join(', ')}.`
+      );
+    }
+    await startBooking(ctx, {
+      clientName: parsed.clientName || undefined,
+      master: parsed.master || undefined,
+      service: parsed.service || undefined,
+      when: parsed.when || undefined,
+      day: parsed.when || parsed.day || undefined,
+      note: parsed.note || null,
+    });
+    return;
   }
 
-  const appointment = await createAppointment({
-    clientName: parsed.clientName,
-    service: parsed.service,
-    master: parsed.master,
-    startsAt: parsed.when,
-    source: 'telegram',
-    note: parsed.note,
-  });
-
-  await ctx.reply(bookedText(appointment), mainMenu);
-  return true;
+  await ctx.reply(SALON_FALLBACK, mainMenu);
 }
 
-function bookedText(a) {
-  return (
-    `✅ Записал: ${a.client_name}, ${salon.formatWhen(new Date(a.starts_at))}` +
-    `${a.service ? `\nУслуга: ${a.service}` : ''}` +
-    `${a.master ? `\nМастер: ${a.master}` : ''}`
-  );
-}
+/* ---------------- команды и кнопки ---------------- */
 
 if (SALON_MODE) {
   bot.command('today', replyToday);
   bot.command('records', replyUpcoming);
   bot.command('slots', replySlots);
-  bot.command('book', (ctx) => ctx.scene.enter('book-client'));
+  bot.command('masters', replyMasters);
+  bot.command('book', (ctx) => startBooking(ctx));
+  bot.command('add', (ctx) => ctx.scene.enter('add-service'));
+
   bot.hears(MENU_TODAY, replyToday);
   bot.hears(MENU_UPCOMING, replyUpcoming);
   bot.hears(MENU_SLOTS, replySlots);
-  bot.hears(MENU_BOOK, (ctx) => ctx.scene.enter('book-client'));
+  bot.hears(MENU_MASTERS, replyMasters);
+  bot.hears(MENU_BOOK, (ctx) => startBooking(ctx));
+  bot.hears(MENU_ADD, (ctx) => ctx.scene.enter('add-service'));
+} else {
+  bot.command('add', (ctx) => ctx.scene.enter('add-product'));
+  bot.command('bulk', (ctx) => ctx.scene.enter('bulk-add'));
+  bot.command('stats', replyStockSummary);
+
+  bot.hears(MENU_ADD, (ctx) => ctx.scene.enter('add-product'));
+  bot.hears(MENU_BULK, (ctx) => ctx.scene.enter('bulk-add'));
+  bot.hears(MENU_STATS, replyStockSummary);
 }
 
 bot.command('list', replyProductList);
-bot.command('stats', replyStockSummary);
 bot.command('help', (ctx) => ctx.reply(HELP_TEXT, mainMenu));
 
-bot.command('bulk', (ctx) => ctx.scene.enter('bulk-add'));
-
-bot.hears(MENU_ADD, (ctx) => ctx.scene.enter('add-product'));
-bot.hears(MENU_BULK, (ctx) => ctx.scene.enter('bulk-add'));
 bot.hears(MENU_LIST, replyProductList);
-bot.hears(MENU_STATS, replyStockSummary);
 bot.hears(MENU_HELP, (ctx) => ctx.reply(HELP_TEXT, mainMenu));
+
+const ITEM_ACC = SALON_MODE ? 'услугу' : 'товар';
 
 bot.command('delete', async (ctx) => {
   const id = Number(ctx.message.text.split(' ')[1]);
   if (!id) {
-    await ctx.reply('Использование: /delete <id>, либо нажмите «🗑 Удалить товар» в /list');
+    await ctx.reply(`Использование: /delete <id>, либо нажмите «🗑 Удалить ${ITEM_ACC}» в /list`);
     return;
   }
   await deleteProduct(id);
-  await ctx.reply(`Товар #${id} удалён.`);
+  await ctx.reply(`#${id} — удалено.`);
 });
 
 // --- Удаление через инлайн-кнопки ---
@@ -730,14 +1329,16 @@ bot.action('pick_delete', async (ctx) => {
   await ctx.answerCbQuery();
   const products = await listProducts({ limit: 20 });
   if (products.length === 0) {
-    await ctx.reply('Товаров нет.');
+    await ctx.reply(SALON_MODE ? 'Услуг нет.' : 'Товаров нет.');
     return;
   }
+  // У услуги показываем цену: «Стрижка (0 шт.)» — это тот самый склад, которого
+  // в салоне быть не должно.
+  const label = (p) =>
+    SALON_MODE ? `${p.name}${p.price != null ? ` — ${p.price}` : ''}` : `${p.name} (${p.quantity ?? 0} шт.)`;
   await ctx.reply(
-    'Какой товар удалить?',
-    Markup.inlineKeyboard(
-      products.map((p) => [Markup.button.callback(`${p.name} (${p.quantity ?? 0} шт.)`, `del:${p.id}`)])
-    )
+    `Какую ${ITEM_ACC} удалить?`,
+    Markup.inlineKeyboard(products.map((p) => [Markup.button.callback(label(p).slice(0, 60), `del:${p.id}`)]))
   );
 });
 
@@ -746,7 +1347,9 @@ bot.action(/^del:(\d+)$/, async (ctx) => {
   const id = Number(ctx.match[1]);
   const product = await getProduct(id);
   await ctx.reply(
-    `Удалить «${product.name}» (остаток ${product.quantity ?? 0})?`,
+    SALON_MODE
+      ? `Удалить услугу «${product.name}»?`
+      : `Удалить «${product.name}» (остаток ${product.quantity ?? 0})?`,
     Markup.inlineKeyboard([
       [Markup.button.callback('✅ Да, удалить', `delyes:${id}`), Markup.button.callback('❌ Отмена', 'cancel')],
     ])
@@ -757,7 +1360,7 @@ bot.action(/^delyes:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const id = Number(ctx.match[1]);
   await deleteProduct(id);
-  await ctx.editMessageText(`Товар #${id} удалён.`);
+  await ctx.editMessageText(SALON_MODE ? `Услуга #${id} удалена.` : `Товар #${id} удалён.`);
 });
 
 bot.action('cancel', async (ctx) => {
@@ -859,21 +1462,22 @@ bot.action('undo', async (ctx) => {
 // --- Входящие сообщения ---
 
 async function handleFreeformText(ctx, text) {
-  // В салоне сообщение сначала проверяем на запись: «запиши Азамата на 15:00» —
-  // это клиент, а не приход товара. Если про запись речи нет, разбираем как
-  // раньше: у салона тот же каталог, только в нём услуги и цены.
-  if (SALON_MODE && (await handleOwnerBooking(ctx, text))) return;
+  // В салоне склада нет вообще. Раньше сообщение, не распознанное как запись,
+  // уходило складскому разборщику — и «запиши Азамата на стрижку» оседало в
+  // каталоге позицией «Стрижка, 1 шт.». Услуга — не товар, считать её штуками
+  // нечего, поэтому этой дороги здесь больше нет.
+  if (SALON_MODE) {
+    await handleSalonText(ctx, text);
+    return;
+  }
 
   const catalog = await getProductNames();
   const actions = await parseStockMessage(text, catalog);
   await applyActionsAndReply(
     ctx,
     actions,
-    SALON_MODE
-      ? 'Не смог понять. Для записи напишите «запиши Азамата завтра в 15:00 на стрижку», ' +
-          'для цены — «стрижка мужская 500», или нажмите «ℹ️ Что я умею».'
-      : 'Не смог понять, что нужно сделать. Попробуйте, например: «приехало 10 пачек сухарей» ' +
-          'или нажмите «ℹ️ Что я умею».'
+    'Не смог понять, что нужно сделать. Попробуйте, например: «приехало 10 пачек сухарей» ' +
+      'или нажмите «ℹ️ Что я умею».'
   );
 }
 
@@ -908,6 +1512,16 @@ bot.on(['voice', 'audio'], async (ctx) => {
 
 // Фото вне сценария добавления товара — считаем накладной и распознаём товары с количеством.
 bot.on('photo', async (ctx) => {
+  // В салоне накладных не бывает: распознавать фото в позиции склада здесь
+  // просто нечем и незачем.
+  if (SALON_MODE) {
+    await ctx.reply(
+      'Фото я не разбираю — я веду записи салона. Напишите или наговорите, кого записать.',
+      mainMenu
+    );
+    return;
+  }
+
   try {
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
     const link = await ctx.telegram.getFileLink(photo.file_id);
@@ -959,6 +1573,7 @@ const COMMANDS = SALON_MODE
       { command: 'today', description: 'Записи на сегодня' },
       { command: 'records', description: 'Все предстоящие записи' },
       { command: 'slots', description: 'Свободные окошки' },
+      { command: 'masters', description: 'Расписание мастеров' },
       { command: 'book', description: 'Записать клиента' },
       { command: 'list', description: 'Услуги и цены' },
       { command: 'help', description: 'Что я умею' },
@@ -1044,4 +1659,11 @@ if (require.main === module) {
 
 // renderToday/renderUpcoming/renderSlots наружу — это готовые экраны записей,
 // их удобно проверять отдельно от Telegram и переиспользовать в сводках.
-module.exports = { launchAdminBot, getAdminStatus, renderToday, renderUpcoming, renderSlots };
+module.exports = {
+  launchAdminBot,
+  getAdminStatus,
+  renderToday,
+  renderUpcoming,
+  renderSlots,
+  renderMasters,
+};

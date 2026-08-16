@@ -240,7 +240,9 @@ function notifyOwnerAboutBooking(appointment, phone) {
     `Когда: ${salon.formatWhen(new Date(appointment.starts_at))}`,
   ];
   if (appointment.service) lines.push(`Услуга: ${appointment.service}`);
-  if (appointment.master) lines.push(`Мастер: ${appointment.master}`);
+  // Мастера пишем всегда: «мастера нет в записи» — это то, что владельцу нужно
+  // решить сегодня, а не заметить завтра по пустой строке.
+  lines.push(`Мастер: ${appointment.master || 'не указан'}`);
   if (appointment.note) lines.push(`Пометка: ${appointment.note}`);
   // Кнопки прямо в уведомлении: чаще всего владелец открывает его один раз —
   // когда клиент пришёл. Заставлять его ради галочки идти в список записей и
