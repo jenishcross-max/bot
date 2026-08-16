@@ -60,7 +60,7 @@ const routes = {
         // Состояние админки видно снаружи: чаще всего «бот отвечает не так» —
         // это незаполненная переменная на сервере, а не поломка в коде.
         salon: {
-          masters: require('./salon').MASTERS,
+          masters: require('./masters').snapshot(),
           hours: require('./salon').workHoursText(),
         },
         telegram: getAdminStatus(),

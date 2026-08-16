@@ -15,6 +15,7 @@ const {
   listAppointments,
 } = require('./db');
 const salon = require('./salon');
+const mastersOf = require('./masters');
 
 // Данные салона. SHOP_* читаются запасным вариантом: они уже заполнены на
 // сервере, и заставлять владельца заводить их заново ради красивого имени
@@ -58,7 +59,9 @@ function buildSalonInfo() {
   return `Информация о салоне (отвечай по ней, ничего не добавляй от себя):\n${lines.join('\n')}`;
 }
 
-const SALON_INFO = buildSalonInfo();
+// Раньше справка собиралась один раз при запуске. Теперь состав салона живой:
+// приняли мастера — клиент должен услышать его имя сегодня, а не после
+// перезапуска сервиса.
 
 function buildManagerText() {
   if (process.env.MANAGER_CONTACT_TEXT) return process.env.MANAGER_CONTACT_TEXT;
@@ -247,38 +250,54 @@ async function loadDay(day) {
   return listAppointments({ from, to, status: 'active', limit: 200 });
 }
 
-async function loadFreeSlots(day, now, duration) {
-  return salon.freeSlots(day, await loadDay(day), { now, duration });
+async function loadFreeSlots(day, now, duration, staffNames) {
+  return salon.freeSlots(day, await loadDay(day), { now, duration, masters: staffNames });
 }
 
-// Сколько времени займёт названная услуга. Неизвестная услуга — обычное окошко:
-// отказывать клиенту из-за того, что он назвал стрижку своими словами, нельзя.
-async function serviceDuration(name) {
-  if (!name) return undefined;
+// Что известно о названной услуге: сколько занимает и какой у неё номер (по
+// нему видно, кто из мастеров её делает). Неизвестная услуга — обычное окошко у
+// любого мастера: отказывать клиенту из-за того, что он назвал стрижку своими
+// словами, нельзя.
+async function serviceInfo(name) {
+  if (!name) return {};
   try {
     const found = await findServiceByName(name);
-    return found?.duration_minutes || undefined;
+    return { duration: found?.duration_minutes || undefined, id: found?.id };
   } catch (err) {
     console.error('Не удалось узнать длительность услуги:', err.message);
-    return undefined;
+    return {};
   }
 }
 
-// Кто свободен в конкретный момент. null — если база не ответила: молча
-// считать время свободным нельзя, тогда двое придут на один час.
-async function checkAvailability(when, duration) {
+// Кто свободен в конкретный момент — с поправкой на выходные и на то, кто
+// делает эту услугу. avail = null, если база не ответила: молча считать время
+// свободным нельзя, тогда двое придут на один час.
+async function checkAvailability(when, duration, serviceId) {
   try {
-    return salon.availabilityAt(when, await loadDay(when), { duration });
+    const staff = await mastersOf.staffOn(when, { serviceId });
+    if (staff.configured && staff.names.length === 0) {
+      // В этот день брать клиента некому: либо общий выходной, либо услугу
+      // никто из работающих не делает. Занятость считать уже не по кому.
+      return { staff, avail: { free: false, masters: [], taken: [] } };
+    }
+    const avail = salon.availabilityAt(when, await loadDay(when), {
+      duration,
+      masters: staff.names,
+    });
+    return { staff, avail };
   } catch (err) {
     console.error('Не удалось проверить занятость времени:', err.message);
-    return null;
+    return { staff: null, avail: null };
   }
 }
 
 // Короткая строка «11:00, 13:00, 16:00» для подсказки внутри другого ответа.
-async function freeTimesText(day, { master, limit = 4, duration } = {}) {
+async function freeTimesText(day, { master, limit = 4, duration, serviceId } = {}) {
   try {
-    let slots = await loadFreeSlots(day, new Date(), duration);
+    const staff = await mastersOf.staffOn(day, { serviceId });
+    if (staff.configured && staff.names.length === 0) return null;
+
+    let slots = await loadFreeSlots(day, new Date(), duration, staff.names);
     if (master) {
       slots = slots.filter((s) => s.masters.length === 0 || s.masters.includes(master));
     }
@@ -295,15 +314,24 @@ async function freeTimesText(day, { master, limit = 4, duration } = {}) {
 // Полный ответ на вопрос о свободном времени. Если спрошенный день занят
 // целиком — не отвечаем «нет», а предлагаем ближайший свободный: отказ без
 // альтернативы клиент читает как «идите в другой салон».
-async function handleSlots(day) {
+async function handleSlots(day, serviceId) {
   const now = new Date();
   const asked = day || now;
+  // Спрошенный день может оказаться общим выходным. Это отдельная новость: «всё
+  // занято» и «в этот день мы не работаем» клиент понимает по-разному.
+  let askedDayOff = false;
 
   for (let i = 0; i <= SLOTS_LOOKAHEAD_DAYS; i += 1) {
     const target = salon.addDays(asked, i);
     let slots;
+    let staff;
     try {
-      slots = await loadFreeSlots(target, now);
+      staff = await mastersOf.staffOn(target, { serviceId });
+      if (staff.configured && staff.names.length === 0) {
+        if (i === 0) askedDayOff = staff.dayOff;
+        continue;
+      }
+      slots = await loadFreeSlots(target, now, undefined, staff.names);
     } catch (err) {
       console.error('Не удалось получить расписание:', err.message);
       return null;
@@ -317,11 +345,12 @@ async function handleSlots(day) {
     const closed = salon
       .daySlots(asked)
       .every((at) => at.getTime() < now.getTime() + salon.LEAD_MINUTES * 60 * 1000);
-    const lines = salon.slotLines(slots, { limit: 6, spread: true });
+    const lines = salon.slotLines(slots, { limit: 6, spread: true, masters: staff.names });
+    const why = askedDayOff ? 'мы не работаем' : closed ? 'мы уже закрываемся' : 'всё занято';
     const head =
       i === 0
         ? `Свободно ${salon.dayLabel(target, now)}:`
-        : `${cap(salon.dayLabel(asked, now))} ${closed ? 'мы уже закрываемся' : 'всё занято'}. ` +
+        : `${cap(salon.dayLabel(asked, now))} ${why}. ` +
           `Ближайшее свободное — ${salon.dayLabel(target, now)}:`;
     // Список теперь растянут на весь день, поэтому «есть время и позже» звучало
     // бы странно: позже — это уже показано. Свободного больше, чем в списке,
@@ -374,6 +403,10 @@ async function handleBooking(chatId, userMessage, history, phone) {
     console.error('Не удалось получить список услуг:', err.message);
   }
 
+  // Состав салона освежаем до разбора: «к Динаре» ищется по справочнику, и
+  // вчерашний список не узнает мастера, которого приняли сегодня.
+  await mastersOf.load().catch(() => {});
+
   const parsed = await salon.parseBookingRequest(userMessage, {
     services,
     history: history.slice(-4),
@@ -391,7 +424,8 @@ async function handleBooking(chatId, userMessage, history, phone) {
     // День берём из слов клиента, если модель его не вернула, — «завтра» она
     // в таком вопросе теряет, а показать вместо завтра сегодня хуже, чем молчать.
     const day = parsed.day || salon.dayFromText(userMessage);
-    const answer = await handleSlots(day);
+    const asked = await serviceInfo(parsed.service);
+    const answer = await handleSlots(day, asked.id);
     if (answer) return answer;
   }
   if (parsed.intent === 'none' && !pending) return null;
@@ -414,9 +448,10 @@ async function handleBooking(chatId, userMessage, history, phone) {
     else draft.master = draft.master || salon.matchMaster(userMessage);
   }
 
-  // Длительность услуги решает всё дальнейшее: и какие окошки свободны, и
-  // успеет ли мастер закончить до закрытия.
-  const duration = await serviceDuration(draft.service);
+  // Услуга решает всё дальнейшее: сколько времени займёт, какие окошки под неё
+  // свободны, успеет ли мастер закончить до закрытия и кто из мастеров её
+  // вообще делает.
+  const { duration, id: serviceId } = await serviceInfo(draft.service);
 
   if (!draft.when) {
     savePending(chatId, draft);
@@ -424,12 +459,12 @@ async function handleBooking(chatId, userMessage, history, phone) {
     // начинается с нуля и это раздражает. И сразу показываем, что свободно:
     // выбрать из четырёх вариантов проще, чем угадывать время самому.
     if (draft.day) {
-      const free = await freeTimesText(draft.day, { master: draft.master, duration });
+      const free = await freeTimesText(draft.day, { master: draft.master, duration, serviceId });
       return free
         ? `Записываю на ${salon.formatDay(draft.day)}. Свободно: ${free}. Во сколько вам удобно?`
         : `Записываю на ${salon.formatDay(draft.day)}. Во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
     }
-    const today = await freeTimesText(new Date(), { duration });
+    const today = await freeTimesText(new Date(), { duration, serviceId });
     return today
       ? `Конечно, запишу вас! Сегодня свободно: ${today}. На какой день и время вам удобно?`
       : `Конечно, запишу вас! Работаем ${salon.workHoursText()}. На какой день и время вам удобно?`;
@@ -444,14 +479,14 @@ async function handleBooking(chatId, userMessage, history, phone) {
       return `Хорошо! А во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
     }
     if (check.reason === 'closed') {
-      const free = await freeTimesText(draft.when, { master: draft.master, duration });
+      const free = await freeTimesText(draft.when, { master: draft.master, duration, serviceId });
       return free
         ? `В это время мы уже закрыты — работаем ${salon.workHoursText()}. ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
         : `В это время мы уже закрыты — работаем ${salon.workHoursText()}. Подберём другое время?`;
     }
     // Начать успеваем, а закончить нет: услуга длинная, а до закрытия близко.
     if (check.reason === 'no_time_left') {
-      const free = await freeTimesText(draft.when, { master: draft.master, duration });
+      const free = await freeTimesText(draft.when, { master: draft.master, duration, serviceId });
       const what = draft.service ? `на «${draft.service}»` : 'на эту услугу';
       return free
         ? `До закрытия не успеем ${what} — работаем ${salon.workHoursText()}. ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
@@ -466,9 +501,45 @@ async function handleBooking(chatId, userMessage, history, phone) {
   // Занятость проверяем до вопроса об имени. В обратном порядке разговор выходит
   // издевательский: бот спрашивает «как вас записать?», клиент представляется —
   // и только тогда узнаёт, что это время занято.
-  const avail = await checkAvailability(draft.when, duration);
+  const { avail, staff } = await checkAvailability(draft.when, duration, serviceId);
+
+  // В этот день клиента брать некому — и причина у этого бывает разная.
+  if (staff && staff.configured && staff.names.length === 0) {
+    savePending(chatId, { ...draft, when: null });
+    const next = await handleSlots(salon.addDays(draft.when, 1), serviceId);
+    if (staff.dayOff) {
+      return (
+        `${cap(salon.dayLabelIn(draft.when))} у нас выходной — в этот день никто не работает.\n` +
+        (next || 'Подскажите другой день, и я подберу время.')
+      );
+    }
+    const what = draft.service ? `«${draft.service}»` : 'эту услугу';
+    return (
+      `${cap(salon.dayLabelIn(draft.when))} ${what} никто из мастеров не делает — ` +
+      'в этот день работают другие.\n' +
+      (next || 'Подскажите другой день, и я подберу время.')
+    );
+  }
+
+  // Клиент попросил мастера, которого в этот день не будет. Это не «занято»:
+  // отвечать «занято» про человека в отпуске — значит обещать, что через час
+  // освободится.
+  const masterAway = Boolean(
+    draft.master && staff && staff.configured && !staff.names.includes(draft.master)
+  );
+  if (masterAway) {
+    savePending(chatId, { ...draft, master: null, askedMaster: true });
+    const free = staff.names.join(', ');
+    return (
+      `${draft.master} ${salon.dayLabelIn(draft.when)} не работает.\n` +
+      (free
+        ? `В это время могут принять: ${free}. Записать к кому-то из них — или подобрать день, когда выйдет ${draft.master}?`
+        : `Подскажите другой день — посмотрю, когда выйдет ${draft.master}.`)
+    );
+  }
+
   const masterBusy = Boolean(
-    avail && draft.master && salon.MASTERS.length > 0 && !avail.masters.includes(draft.master)
+    avail && draft.master && staff && staff.names.length > 0 && !avail.masters.includes(draft.master)
   );
 
   if (avail && (!avail.free || masterBusy)) {
@@ -496,14 +567,15 @@ async function handleBooking(chatId, userMessage, history, phone) {
   // этот вопрос задавать бессмысленно: пока час не выбран, неизвестно, кто в
   // этот час вообще свободен. А если свободен один — вопроса не будет вовсе.
   const freeMasters = avail ? avail.masters : [];
-  if (salon.MASTERS.length > 0 && !draft.master && !draft.anyMaster && freeMasters.length > 1) {
+  const hasMasters = Boolean(staff && staff.configured);
+  if (hasMasters && !draft.master && !draft.anyMaster && freeMasters.length > 1) {
     savePending(chatId, { ...draft, askedMaster: true });
     return (
       `${cap(salon.formatWhen(draft.when))} свободны: ${freeMasters.join(', ')}. ` +
       'К кому вас записать? Можно ответить «всё равно» — посажу к свободному.'
     );
   }
-  if (salon.MASTERS.length > 0 && !draft.master && freeMasters.length > 0) {
+  if (hasMasters && !draft.master && freeMasters.length > 0) {
     draft.master = freeMasters[0];
   }
 
@@ -519,6 +591,9 @@ async function handleBooking(chatId, userMessage, history, phone) {
       chatId,
       service: draft.service,
       master: draft.master,
+      // Ссылка на справочник мастеров: по ней запись остаётся привязанной к
+      // человеку, даже если владелец потом поправит написание имени.
+      masterId: draft.master ? await mastersOf.idByName(draft.master) : undefined,
       startsAt: draft.when,
       durationMinutes: duration,
       source: 'whatsapp',
@@ -602,8 +677,9 @@ async function getAIReply(chatId, userMessage, { phone, photo } = {}) {
 
   const systemMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
-  if (SALON_INFO) {
-    systemMessages.push({ role: 'system', content: SALON_INFO });
+  const salonInfo = buildSalonInfo();
+  if (salonInfo) {
+    systemMessages.push({ role: 'system', content: salonInfo });
   }
   try {
     // По фото ищем словами, которые подобрала модель зрения: подпись вроде

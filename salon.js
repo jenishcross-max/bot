@@ -35,10 +35,27 @@ function appointmentDuration(a) {
   const raw = Number(a?.duration_minutes);
   return Number.isFinite(raw) && raw > 0 ? raw : SLOT_MINUTES;
 }
-const MASTERS = (process.env.SALON_MASTERS || '')
+// Имена мастеров из настроек сервера. Раньше это был весь справочник салона;
+// теперь — только начальное заполнение: с него masters.js заводит мастеров в
+// базе при первом запуске, и он же остаётся запасным составом, если база
+// недоступна или таблицы мастеров ещё не созданы.
+const ENV_MASTERS = (process.env.SALON_MASTERS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+
+// Текущий состав салона. Массив живой и намеренно не пересоздаётся: и админка,
+// и WhatsApp-бот держат на него ссылку, а состав меняется прямо во время
+// работы — приняли мастера, отправили в отпуск, скрыли уволившегося. Создай мы
+// новый массив, половина кода продолжила бы работать со вчерашним списком.
+const MASTERS = [...ENV_MASTERS];
+
+function setMasters(names) {
+  const clean = [...new Set((names || []).map((s) => String(s || '').trim()).filter(Boolean))];
+  MASTERS.length = 0;
+  MASTERS.push(...clean);
+  return MASTERS;
+}
 
 // За сколько минут до начала окошко перестаёт быть свободным. Предлагать
 // клиенту «через пять минут» бессмысленно: он не успеет доехать, а мастер
@@ -156,6 +173,21 @@ function dayLabel(date, now = new Date()) {
   if (sameLocalDay(date, new Date(now.getTime() + 24 * 60 * 60 * 1000))) return 'завтра';
   const p = localParts(date);
   return `${WEEKDAYS[p.weekday]}, ${p.day} ${MONTHS[p.month - 1]}`;
+}
+
+// То же самое, но в форме, которая встаёт в середину фразы: «Динара завтра не
+// работает», «в среду, 19 августа у нас выходной». Без предлога получается
+// «Динара среда, 19 августа не работает» — по-русски так не говорят.
+const WEEKDAYS_IN = [
+  'в воскресенье', 'в понедельник', 'во вторник', 'в среду',
+  'в четверг', 'в пятницу', 'в субботу',
+];
+
+function dayLabelIn(date, now = new Date()) {
+  if (sameLocalDay(date, now)) return 'сегодня';
+  if (sameLocalDay(date, new Date(now.getTime() + 24 * 60 * 60 * 1000))) return 'завтра';
+  const p = localParts(date);
+  return `${WEEKDAYS_IN[p.weekday]}, ${p.day} ${MONTHS[p.month - 1]}`;
 }
 
 function addDays(date, days) {
@@ -558,6 +590,8 @@ async function parseBookingRequest(text, { services = [], history = [], now = ne
 module.exports = {
   TIMEZONE,
   MASTERS,
+  ENV_MASTERS,
+  setMasters,
   SLOT_MINUTES,
   SLOT_STEP,
   appointmentDuration,
@@ -573,12 +607,14 @@ module.exports = {
   dayOffset,
   localMinutes,
   atLocalTime,
+  masterKey,
   matchMaster,
   dayFromText,
   formatTime,
   formatDay,
   formatWhen,
   dayLabel,
+  dayLabelIn,
   daySlots,
   availabilityAt,
   freeSlots,

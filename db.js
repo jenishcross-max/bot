@@ -188,6 +188,94 @@ async function saveService({ name, price, durationMinutes }) {
   return { service: created, created: true };
 }
 
+/* ---------------- мастера ----------------
+   Раньше мастера были строкой в настройках сервера (SALON_MASTERS): чтобы
+   принять на работу человека, владельцу приходилось лезть в панель Render и
+   перезапускать сервис. Выходных и специализаций там не было вовсе. Теперь это
+   обычная таблица, которую видно и правится из Телеграма. */
+
+async function listMasters() {
+  const { data, error } = await supabase
+    .from('masters')
+    .select('*')
+    .order('active', { ascending: false })
+    .order('name');
+  if (error) throw error;
+  return data;
+}
+
+async function getMaster(id) {
+  const { data, error } = await supabase.from('masters').select('*').eq('id', id).single();
+  if (error) throw error;
+  return data;
+}
+
+async function addMaster({ name, active = true, workDays }) {
+  const clean = String(name || '').trim().slice(0, 60);
+  if (!clean) throw new Error('Не указано имя мастера');
+
+  const insert = { name: clean, active };
+  if (workDays) insert.work_days = workDays;
+
+  const { data, error } = await supabase.from('masters').insert(insert).select().single();
+  if (error) throw error;
+  return data;
+}
+
+async function updateMaster(id, patch) {
+  const { data, error } = await supabase.from('masters').update(patch).eq('id', id).select().single();
+  if (error) throw error;
+  return data;
+}
+
+// Все связки «мастер — услуга» разом: их на салон десятки, а не тысячи, и одним
+// запросом это дешевле, чем спрашивать базу про каждого мастера отдельно.
+async function listMasterServices() {
+  const { data, error } = await supabase.from('master_services').select('master_id, service_id');
+  if (error) throw error;
+  return data;
+}
+
+async function setMasterService(masterId, serviceId, on) {
+  if (on) {
+    const { error } = await supabase
+      .from('master_services')
+      .upsert({ master_id: masterId, service_id: serviceId });
+    if (error) throw error;
+    return;
+  }
+  const { error } = await supabase
+    .from('master_services')
+    .delete()
+    .eq('master_id', masterId)
+    .eq('service_id', serviceId);
+  if (error) throw error;
+}
+
+// Выходные берём начиная со вчерашнего дня: прошлые отгулы на расписание уже
+// не влияют, а таблица за год накопит их сотни.
+async function listDaysOff({ from } = {}) {
+  let query = supabase.from('master_days_off').select('master_id, day').order('day');
+  if (from) query = query.gte('day', from);
+  const { data, error } = await query.limit(500);
+  if (error) throw error;
+  return data;
+}
+
+async function setDayOff(masterId, day, on) {
+  if (on) {
+    const { error } = await supabase.from('master_days_off').upsert({ master_id: masterId, day });
+    if (error) throw error;
+    return;
+  }
+  const { error } = await supabase
+    .from('master_days_off')
+    .delete()
+    .eq('master_id', masterId)
+    .eq('day', day);
+  if (error) throw error;
+}
+
 /* ---------------- записи клиентов ---------------- */
 
 // Статусы держим строками, а не булевыми флагами: «отменена», «пришёл» и «не
@@ -200,6 +288,7 @@ async function createAppointment({
   chatId,
   service,
   master,
+  masterId,
   startsAt,
   durationMinutes,
   source = 'whatsapp',
@@ -213,6 +302,10 @@ async function createAppointment({
       chat_id: chatId || null,
       service: service || null,
       master: master || null,
+      // Имя мастера пишем по-прежнему, а ссылку — только когда справочник
+      // заведён. Пока supabase_salon_step2.sql не выполнен, колонки master_id
+      // в таблице нет, и упоминание её в запросе уронило бы саму запись.
+      ...(Number.isFinite(Number(masterId)) ? { master_id: Number(masterId) } : {}),
       starts_at: new Date(startsAt).toISOString(),
       // Длительность записываем снимком: услуга подорожает и удлинится, а
       // вчерашняя запись должна занимать столько, сколько занимала.
@@ -274,10 +367,11 @@ async function setAppointmentStatus(id, status) {
 // Перенос записи: меняется время, иногда заодно мастер. Отдельной функцией, а не
 // «отменить и создать заново», — иначе в истории клиента вместо одного визита
 // остаётся отменённая запись и загадочная новая.
-async function moveAppointment(id, { startsAt, master, durationMinutes }) {
+async function moveAppointment(id, { startsAt, master, masterId, durationMinutes }) {
   const patch = {};
   if (startsAt) patch.starts_at = new Date(startsAt).toISOString();
   if (master !== undefined) patch.master = master || null;
+  if (masterId !== undefined) patch.master_id = Number.isFinite(Number(masterId)) ? Number(masterId) : null;
   if (durationMinutes !== undefined) patch.duration_minutes = cleanDuration(durationMinutes);
 
   const { data, error } = await supabase
@@ -307,6 +401,25 @@ async function findClientAppointments({ phone, chatId, status = 'active', limit 
   return data;
 }
 
+// Записи, у которых мастер записан именем, но не связан со справочником. Это
+// всё, что было создано до появления таблицы мастеров.
+async function listUnlinkedAppointments({ limit = 1000 } = {}) {
+  const { data, error } = await supabase
+    .from('appointments')
+    .select('id, master')
+    .is('master_id', null)
+    .not('master', 'is', null)
+    .limit(limit);
+  if (error) throw error;
+  return data;
+}
+
+async function linkAppointments(ids, masterId) {
+  if (!ids || ids.length === 0) return;
+  const { error } = await supabase.from('appointments').update({ master_id: masterId }).in('id', ids);
+  if (error) throw error;
+}
+
 module.exports = {
   createAppointment,
   listAppointments,
@@ -322,4 +435,14 @@ module.exports = {
   saveService,
   searchServices,
   findServiceByName,
+  listMasters,
+  getMaster,
+  addMaster,
+  updateMaster,
+  listMasterServices,
+  setMasterService,
+  listDaysOff,
+  setDayOff,
+  listUnlinkedAppointments,
+  linkAppointments,
 };
