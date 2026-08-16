@@ -42,7 +42,8 @@ services:
 
       # --- Салон ---
       # Отдельного переключателя режима больше нет: бот всегда работает как салон.
-      # Требует таблиц из supabase_schema.sql и supabase_salon_step1.sql.
+      # Требует таблиц из supabase_schema.sql, а на уже заведённой базе —
+      # supabase_salon_step1.sql, step2 (мастера) и step3 (напоминания).
       - key: SALON_NAME
         sync: false
       - key: SALON_ADDRESS
@@ -66,6 +67,16 @@ services:
         value: "30"
       - key: SALON_LEAD_MINUTES
         value: "30"
+
+      # --- Напоминания клиентам ---
+      # Час накануне, в который бот пишет клиенту (по времени салона), и за
+      # сколько минут напоминать, если запись сделали позже этого часа.
+      # Требуют supabase_salon_step3.sql. Уснувший сервис ничего не шлёт:
+      # заведите внешний будильник на <адрес сервиса>/cron раз в 5–10 минут.
+      - key: SALON_REMINDER_HOUR
+        value: "19"
+      - key: SALON_REMINDER_LEAD_MINUTES
+        value: "120"
 
       - key: CURRENCY
         value: сом

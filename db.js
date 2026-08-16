@@ -373,6 +373,10 @@ async function moveAppointment(id, { startsAt, master, masterId, durationMinutes
   if (master !== undefined) patch.master = master || null;
   if (masterId !== undefined) patch.master_id = Number.isFinite(Number(masterId)) ? Number(masterId) : null;
   if (durationMinutes !== undefined) patch.duration_minutes = cleanDuration(durationMinutes);
+  // Время поменялось — значит, прежнее напоминание больше ничего не значит:
+  // клиент должен получить новое, про новое время. О самом переносе ему
+  // сообщают сразу, но это было вчера, а напоминание нужно накануне.
+  if (startsAt && (await remindersReady())) patch.reminded_at = null;
 
   const { data, error } = await supabase
     .from('appointments')
@@ -399,6 +403,128 @@ async function findClientAppointments({ phone, chatId, status = 'active', limit 
   const { data, error } = await query.limit(limit);
   if (error) throw error;
   return data;
+}
+
+/* ---------------- напоминания ----------------
+   Отметка «клиенту напомнили» живёт в базе, а не в памяти бота: бесплатный
+   Render перезапускает сервис по нескольку раз в сутки, и после каждого
+   перезапуска напоминания уходили бы клиентам заново. */
+
+// Колонка reminded_at появляется только после supabase_salon_step3.sql. Между
+// выкладкой кода и этим моментом её нет, и любой запрос с ней падает — поэтому
+// один раз проверяем и запоминаем.
+let remindersColumn = null;
+
+async function remindersReady() {
+  if (remindersColumn !== null) return remindersColumn;
+
+  const { error } = await supabase.from('appointments').select('id, reminded_at').limit(1);
+  if (!error) {
+    remindersColumn = true;
+    return true;
+  }
+  // Колонки нет — это навсегда (до выполнения скрипта), запоминаем. А вот сеть
+  // могла отвалиться на минуту: такой ответ не запоминаем, иначе напоминания
+  // останутся выключенными до перезапуска сервиса.
+  if (/reminded_at/i.test(error.message || '') || error.code === '42703' || error.code === 'PGRST204') {
+    remindersColumn = false;
+    return false;
+  }
+  console.error('Не удалось проверить колонку reminded_at:', error.message);
+  return false;
+}
+
+// Кому ещё не напомнили: активные записи от «сейчас» до горизонта. Кого именно
+// пора трогать, решает reminders.js — здесь только выборка.
+async function listDueReminders({ from = new Date(), to, limit = 100 } = {}) {
+  if (!(await remindersReady())) return [];
+
+  let query = supabase
+    .from('appointments')
+    .select('*')
+    .eq('status', 'active')
+    .is('reminded_at', null)
+    .gte('starts_at', new Date(from).toISOString())
+    .order('starts_at', { ascending: true });
+
+  if (to) query = query.lt('starts_at', new Date(to).toISOString());
+
+  const { data, error } = await query.limit(limit);
+  if (error) throw error;
+  return data;
+}
+
+async function markReminded(id, at = new Date()) {
+  if (!(await remindersReady())) return null;
+  const { data, error } = await supabase
+    .from('appointments')
+    .update({ reminded_at: new Date(at).toISOString() })
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/* ---------------- история неявок ----------------
+   Клиент, который дважды не пришёл, — это не «плохой человек», а знание,
+   которое владельцу нужно в момент записи: позвонить накануне, попросить
+   предоплату или просто не держать окно. Считаем по номеру и по чату: у одного
+   и того же человека может не быть номера, но быть переписка в WhatsApp. */
+
+// Отбор «этот же клиент» одинаков для счётчика и для истории.
+function sameClient(query, digits, chatId) {
+  if (digits && chatId) return query.or(`phone.eq.${digits},chat_id.eq.${chatId}`);
+  return query.eq(digits ? 'phone' : 'chat_id', digits || chatId);
+}
+
+// Сколько раз клиент не пришёл. Считаем строки, а не count из PostgREST:
+// разница между «два раза» и «двадцать» владельцу уже не важна, а лишний режим
+// запроса — лишнее место, где что-то отвалится.
+async function countNoShows({ phone, chatId, excludeId } = {}) {
+  const digits = phone ? String(phone).replace(/\D/g, '') : null;
+  if (!digits && !chatId) return 0;
+
+  let query = supabase.from('appointments').select('id').eq('status', 'no_show');
+  query = sameClient(query, digits, chatId);
+  if (excludeId) query = query.neq('id', excludeId);
+
+  const { data, error } = await query.limit(20);
+  if (error) throw error;
+  return data.length;
+}
+
+// Неявки, сложенные по клиентам. Складываем здесь, а не запросом: одного и
+// того же человека опознаём по номеру, по чату или по имени, и такое «или» в
+// group by не выражается. Строки приходят отсортированными от свежих к старым,
+// поэтому первая встреченная запись клиента и есть последняя по времени.
+function groupNoShows(rows) {
+  const clients = new Map();
+  for (const a of rows) {
+    const key = a.phone || a.chat_id || `name:${String(a.client_name || '').toLowerCase()}`;
+    if (!clients.has(key)) {
+      clients.set(key, { name: a.client_name, phone: a.phone, count: 0, lastAt: a.starts_at });
+    }
+    const client = clients.get(key);
+    client.count += 1;
+    // Номер мог появиться позже первой неявки — берём любой известный.
+    if (!client.phone && a.phone) client.phone = a.phone;
+  }
+  return [...clients.values()].sort((x, y) => y.count - x.count);
+}
+
+// Кто не приходил за последние месяцы — списком, по клиентам.
+async function listNoShows({ days = 90, limit = 200 } = {}) {
+  const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const { data, error } = await supabase
+    .from('appointments')
+    .select('*')
+    .eq('status', 'no_show')
+    .gte('starts_at', from.toISOString())
+    .order('starts_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return groupNoShows(data);
 }
 
 // Записи, у которых мастер записан именем, но не связан со справочником. Это
@@ -445,4 +571,10 @@ module.exports = {
   setDayOff,
   listUnlinkedAppointments,
   linkAppointments,
+  remindersReady,
+  listDueReminders,
+  markReminded,
+  countNoShows,
+  listNoShows,
+  groupNoShows,
 };

@@ -13,6 +13,7 @@ const {
   findClientAppointments,
   setAppointmentStatus,
   listAppointments,
+  countNoShows,
 } = require('./db');
 const salon = require('./salon');
 const mastersOf = require('./masters');
@@ -208,7 +209,7 @@ function bookingSummary(a) {
   return parts.join(', ');
 }
 
-function notifyOwnerAboutBooking(appointment, phone) {
+async function notifyOwnerAboutBooking(appointment, phone) {
   const lines = [
     '🗓 Новая запись!',
     '',
@@ -221,17 +222,31 @@ function notifyOwnerAboutBooking(appointment, phone) {
   // решить сегодня, а не заметить завтра по пустой строке.
   lines.push(`Мастер: ${appointment.master || 'не указан'}`);
   if (appointment.note) lines.push(`Пометка: ${appointment.note}`);
+
+  // Клиент, который уже не приходил, — не повод отказать, а повод позвонить
+  // накануне. Сказать об этом надо сейчас: карточку записи владелец откроет
+  // хорошо если через неделю.
+  try {
+    const misses = await countNoShows({
+      phone: appointment.phone || phone,
+      chatId: appointment.chat_id,
+      excludeId: appointment.id,
+    });
+    if (misses > 0) lines.push('', `⚠️ Этот клиент раньше не приходил: ${misses}`);
+  } catch (err) {
+    console.error('Не удалось посчитать неявки клиента:', err.message);
+  }
   // Кнопки прямо в уведомлении: чаще всего владелец открывает его один раз —
   // когда клиент пришёл. Заставлять его ради галочки идти в список записей и
   // искать там нужную строку — лишний шаг, который никто не делает.
-  notifyAdmins(lines.join('\n'), {
+  await notifyAdmins(lines.join('\n'), {
     buttons: [
       [
         { text: '✅ Клиент пришёл', callback_data: `n_done:${appointment.id}` },
         { text: '❌ Отменить', callback_data: `appt_cancel:${appointment.id}` },
       ],
     ],
-  }).catch((err) => console.error('Не удалось сообщить владельцу о записи:', err));
+  });
 }
 
 /* ---------------- свободные окошки ----------------
@@ -601,7 +616,11 @@ async function handleBooking(chatId, userMessage, history, phone) {
     });
 
     pendingBookings.delete(chatId);
-    notifyOwnerAboutBooking(appointment, phone);
+    // Ответа не ждём: клиент не должен ждать в переписке, пока сходит
+    // уведомление владельцу.
+    notifyOwnerAboutBooking(appointment, phone).catch((err) =>
+      console.error('Не удалось сообщить владельцу о записи:', err.message)
+    );
 
     const lines = [`Готово, ${draft.clientName}! Записала вас: ${bookingSummary(appointment)}.`];
     if (SALON_ADDRESS) lines.push(`Адрес: ${SALON_ADDRESS}`);

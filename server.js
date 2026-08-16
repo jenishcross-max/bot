@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const { startBot, getStatus } = require('./index');
 const { launchAdminBot, getAdminStatus } = require('./telegram-admin-bot');
+const reminders = require('./reminders');
 
 const PORT = process.env.PORT || 3000;
 const startedAt = new Date();
@@ -48,9 +49,19 @@ function page(body) {
   );
 }
 
+// Любой входящий запрос будит уснувший сервис — и это единственный момент,
+// когда он может разослать напоминания за то время, что спал. Поэтому проход
+// запускаем на каждом пинге, но ответа не ждём: внешнему будильнику нужен
+// быстрый ответ, а не отчёт. Сам проход не чаще раза в минуту — это решает
+// reminders.js.
+function wakeReminders(reason) {
+  reminders.run(reason).catch((err) => console.error('Напоминания:', err.message));
+}
+
 const routes = {
-  '/': (req, res) =>
-    send(
+  '/': (req, res) => {
+    wakeReminders('пинг');
+    return send(
       res,
       200,
       'application/json; charset=utf-8',
@@ -64,10 +75,27 @@ const routes = {
           hours: require('./salon').workHoursText(),
         },
         telegram: getAdminStatus(),
+        reminders: reminders.status(),
         startedAt: startedAt.toISOString(),
         uptimeSeconds: Math.round(process.uptime()),
       })
-    ),
+    );
+  },
+
+  // Адрес для внешнего будильника (cron-job.org, UptimeRobot и подобные).
+  // Отдельно от главной страницы, чтобы в настройках будильника было видно,
+  // зачем он вообще заведён. Секрета здесь нет и быть не должно: наружу
+  // отдаются только счётчики, а сам стук ничего не меняет — он лишь будит
+  // сервис и запускает тот же проход, что и таймер внутри.
+  '/cron': (req, res) => {
+    wakeReminders('будильник');
+    return send(
+      res,
+      200,
+      'application/json; charset=utf-8',
+      JSON.stringify({ ok: true, reminders: reminders.status() })
+    );
+  },
 
   // Страница с кодом. Перезагружается сама: QR живёт около 20 секунд, вручную
   // обновлять быстрее, чем он протухает, никто не будет.
@@ -142,11 +170,11 @@ http
   .listen(PORT, () => console.log(`Health-эндпоинт слушает порт ${PORT}.`));
 
 // Бесплатный тариф Render усыпляет сервис после ~15 минут без входящих запросов.
-// Спящий бот не отвечает в WhatsApp: сообщение клиента сервис не будит, будит только
-// HTTP-запрос. Поэтому раз в 10 минут дёргаем сами себя по внешнему адресу
-// (RENDER_EXTERNAL_URL Render подставляет автоматически).
+// Спящий бот не отвечает в WhatsApp и не шлёт напоминаний: сообщение клиента сервис
+// не будит, будит только HTTP-запрос. Поэтому раз в 10 минут дёргаем сами себя по
+// внешнему адресу (RENDER_EXTERNAL_URL Render подставляет автоматически).
 // Свой пинг — подстраховка, а не замена внешнему монитору: пока сервис уже уснул,
-// разбудить себя он не может.
+// разбудить себя он не может. Внешний будильник настраивается на /cron.
 const KEEPALIVE_URL = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL;
 if (KEEPALIVE_URL && process.env.KEEPALIVE !== 'false') {
   const https = require('https');
@@ -172,3 +200,9 @@ launchAdminBot({ publicUrl: PUBLIC_URL.startsWith('https://') ? PUBLIC_URL : nul
 startBot().catch((err) => {
   console.error('Не удалось запустить WhatsApp-бота:', err);
 });
+
+// Напоминания клиентам: накануне в 19:00, а для поздних записей — за два часа.
+// Таймер внутри процесса плюс внешний будильник на /cron: пока сервис не спит,
+// работает таймер; уснувший будит стук снаружи, и проснувшийся бот сразу
+// догоняет пропущенное.
+reminders.start();

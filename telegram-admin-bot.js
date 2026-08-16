@@ -20,10 +20,13 @@ const {
   getAppointment,
   setAppointmentStatus,
   moveAppointment,
+  countNoShows,
+  listNoShows,
 } = require('./db');
 const { transcribeVoice } = require('./media-ai');
 const salon = require('./salon');
 const masters = require('./masters');
+const reminders = require('./reminders');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_IDS = (process.env.ADMIN_TELEGRAM_IDS || '')
@@ -224,6 +227,11 @@ const HELP_TEXT =
   'Нажмите на запись — откроются кнопки: ✅ клиент пришёл, 🔄 перенести, ' +
   '🚫 не пришёл, ❌ отменить.\n' +
   'Перенос я сам сообщу клиенту в WhatsApp, если он записывался через него.\n\n' +
+  '🔔 О записи я напоминаю клиенту сам: накануне в 19:00, а если записались ' +
+  'позже — за два часа. Кто записывался не через WhatsApp — про того попрошу ' +
+  'позвонить вас.\n' +
+  '🚫 «Не пришёл» я запоминаю: /noshows — история неявок, и о таком клиенте ' +
+  'я предупрежу прямо в карточке новой записи.\n\n' +
   'Можно и без кнопок — напишите или наговорите голосом:\n' +
   '• «запиши Азамата завтра в 15:00 на стрижку»\n' +
   '• «запись к мастеру Динаре в 11» — чего не хватит, я спрошу кнопками\n' +
@@ -352,11 +360,47 @@ function appointmentButtons(list) {
     ]);
 }
 
-function appointmentCard(a) {
+// Сколько раз этот клиент уже не приходил. Владельцу это нужно ровно в двух
+// местах: когда он смотрит на запись и когда запись только что появилась. Не
+// как приговор — как повод позвонить накануне вместо сообщения.
+function timesWord(n) {
+  const teen = n % 100;
+  if (teen >= 11 && teen <= 14) return 'раз';
+  const last = n % 10;
+  return last >= 2 && last <= 4 ? 'раза' : 'раз';
+}
+
+// «Гуля не пришёл» — так не говорят, а пола клиента мы не знаем и знать не
+// должны. Поэтому там, где подлежащее — имя, считаем неявки, а не «разы».
+function noShowsWord(n) {
+  const teen = n % 100;
+  if (teen >= 11 && teen <= 14) return 'неявок';
+  const last = n % 10;
+  if (last === 1) return 'неявка';
+  return last >= 2 && last <= 4 ? 'неявки' : 'неявок';
+}
+
+async function noShowLine(a, { excludeCurrent = true } = {}) {
+  try {
+    const count = await countNoShows({
+      phone: a.phone,
+      chatId: a.chat_id,
+      excludeId: excludeCurrent ? a.id : undefined,
+    });
+    if (count === 0) return '';
+    return `\n⚠️ Клиент не приходил ${count} ${timesWord(count)}`;
+  } catch (err) {
+    console.error('Не удалось посчитать неявки:', err.message);
+    return '';
+  }
+}
+
+async function appointmentCard(a) {
   return {
     text: `Запись: ${a.client_name}\n${salon.formatWhen(new Date(a.starts_at))}` +
       `${a.service ? `\nУслуга: ${a.service}` : ''}` +
-      `\nМастер: ${a.master || 'не указан'}\nТелефон: ${phoneText(a)}`,
+      `\nМастер: ${a.master || 'не указан'}\nТелефон: ${phoneText(a)}` +
+      (await noShowLine(a)),
     rows: [
       [Markup.button.callback('✅ Клиент пришёл', `appt_done:${a.id}`)],
       [Markup.button.callback('🔄 Перенести', `mv:${a.id}`)],
@@ -391,9 +435,15 @@ async function renderToday() {
   const list = all.filter((a) => a.status !== 'cancelled');
   const stale = await unmarkedCount();
   const staleLine = stale > 0 ? `\n\n⏳ Не отмечено за прошлые дни: ${stale}. Нажмите «🗓 Все записи».` : '';
+  // Напоминания могут быть выключены — по одной невыполненной строчке в базе.
+  // Молчать об этом нельзя: владелец будет думать, что клиентам напоминают.
+  const warning = reminders.warning();
+  const warningLine = warning ? `\n\n⚠️ ${warning}` : '';
 
   if (list.length === 0) {
-    return { text: `📅 ${salon.formatDay(new Date())}\n\nНа сегодня записей нет.${staleLine}` };
+    return {
+      text: `📅 ${salon.formatDay(new Date())}\n\nНа сегодня записей нет.${staleLine}${warningLine}`,
+    };
   }
 
   const left = list.filter((a) => a.status === 'active').length;
@@ -401,7 +451,7 @@ async function renderToday() {
     text:
       `📅 ${salon.formatDay(new Date())}\n\n` +
       list.map(appointmentLine).join('\n\n') +
-      `\n\nВсего ${list.length}, впереди ${left}.${staleLine}`,
+      `\n\nВсего ${list.length}, впереди ${left}.${staleLine}${warningLine}`,
     keyboard: Markup.inlineKeyboard(appointmentButtons(list)),
   };
 }
@@ -435,9 +485,59 @@ async function renderUpcoming() {
 
   return {
     text: `${head}🗓 Активных записей: ${list.length}\n\n${blocks.join('\n\n')}`,
-    keyboard: Markup.inlineKeyboard(appointmentButtons([...stale, ...list])),
+    keyboard: Markup.inlineKeyboard([
+      ...appointmentButtons([...stale, ...list]),
+      [Markup.button.callback('🚫 История неявок', 'noshows')],
+    ]),
   };
 }
+
+/* ---------------- история неявок ----------------
+   Не список должников и не приговор клиенту. Владельцу это нужно ровно для
+   одного решения: звонить накануне или хватит сообщения. Клиент, который
+   дважды не пришёл, — это два часа пустого кресла, и лучше знать о них
+   заранее, чем удивляться в третий раз. */
+
+const NO_SHOW_DAYS = 90;
+
+async function renderNoShows() {
+  const clients = await listNoShows({ days: NO_SHOW_DAYS });
+
+  if (clients.length === 0) {
+    return {
+      text:
+        `🚫 Неявки за ${NO_SHOW_DAYS} дней\n\nВсе приходили — ни одной отметки.\n\n` +
+        'Если клиент не пришёл, откройте его запись и нажмите «🚫 Не пришёл» — ' +
+        'тогда в следующий раз я напомню вам об этом прямо в карточке записи.',
+    };
+  }
+
+  const lines = clients.map((c) => {
+    const phone = c.phone ? ` · +${c.phone}` : '';
+    return (
+      `${c.name || 'Без имени'}${phone}\n` +
+      `         ${c.count} ${noShowsWord(c.count)}, последняя ${salon.formatDay(new Date(c.lastAt))}`
+    );
+  });
+
+  return {
+    text:
+      `🚫 Неявки за ${NO_SHOW_DAYS} дней\n\n${lines.join('\n\n')}\n\n` +
+      'Считаю по вашим отметкам «🚫 Не пришёл». Когда такой клиент запишется снова, ' +
+      'я напишу об этом в карточке записи и в уведомлении.',
+  };
+}
+
+async function replyNoShows(ctx) {
+  const { text } = await renderNoShows();
+  await ctx.reply(text, mainMenu);
+}
+
+bot.action('noshows', async (ctx) => {
+  await ctx.answerCbQuery();
+  const { text } = await renderNoShows();
+  await ctx.reply(text);
+});
 
 // Свободные окошки. Считаются тем же кодом, что и для клиента в WhatsApp:
 // разойдись эти два расчёта — владелец пообещает по телефону время, которое
@@ -944,7 +1044,7 @@ async function refreshView(ctx, appointment) {
 bot.action(/^appt:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const appointment = await getAppointment(Number(ctx.match[1]));
-  const card = appointmentCard(appointment);
+  const card = await appointmentCard(appointment);
   await show(ctx, true, card.text, card.rows);
 });
 
@@ -976,6 +1076,15 @@ bot.action(/^n_done:(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery(`${updated.client_name} — отмечен`);
   const text = ctx.callbackQuery?.message?.text || 'Запись';
   await ctx.editMessageText(`${text}\n\n✔️ Клиент пришёл.`).catch(() => {});
+});
+
+// «Позвонил» из напоминания о клиенте без WhatsApp. Ничего в базе не меняет —
+// отметка «напомнили» там уже стоит, — но вычёркивает дело из списка: иначе
+// владелец возвращается к сообщению и не помнит, звонил он или собирался.
+bot.action(/^n_called:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Отметил');
+  const text = ctx.callbackQuery?.message?.text || 'Напоминание';
+  await ctx.editMessageText(`${text}\n\n✔️ Позвонил.`).catch(() => {});
 });
 
 bot.action(/^appt_cancel:(\d+)$/, async (ctx) => {
@@ -1496,7 +1605,10 @@ async function saveDraft(ctx, { force = false } = {}) {
       note: d.note,
     });
     sessionOf(ctx).booking = null;
-    await show(ctx, true, bookedText(appointment));
+    // Про неявки говорим сразу после записи: если этот клиент дважды не
+    // приходил, решать «звонить накануне или нет» владелец будет сейчас, а не
+    // когда откроет карточку через неделю.
+    await show(ctx, true, bookedText(appointment) + (await noShowLine(appointment)));
   } catch (err) {
     console.error('Не удалось создать запись:', err.message);
     await show(ctx, true, `Не удалось сохранить запись.\n${err.message}`);
@@ -1808,6 +1920,7 @@ async function handleOwnerText(ctx, text) {
 
 bot.command('today', replyToday);
 bot.command('records', replyUpcoming);
+bot.command('noshows', replyNoShows);
 bot.command('slots', replySlots);
 bot.command('masters', replyMasters);
 bot.command('book', (ctx) => startBooking(ctx));
@@ -1906,6 +2019,7 @@ function webhookPath() {
 const COMMANDS = [
   { command: 'today', description: 'Записи на сегодня' },
   { command: 'records', description: 'Все предстоящие записи' },
+  { command: 'noshows', description: 'История неявок' },
   { command: 'slots', description: 'Свободные окошки' },
   { command: 'masters', description: 'Расписание мастеров' },
   { command: 'book', description: 'Записать клиента' },
@@ -2010,4 +2124,5 @@ module.exports = {
   renderUpcoming,
   renderSlots,
   renderMasters,
+  renderNoShows,
 };

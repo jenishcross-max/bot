@@ -1,6 +1,7 @@
 -- Схема базы салона. Выполните в Supabase: Project -> SQL Editor -> New query.
--- Если база уже заведена по старой версии — выполните supabase_salon_step1.sql
--- и supabase_salon_step2.sql: они дополняют её, ничего не удаляя.
+-- Если база уже заведена по старой версии — выполните supabase_salon_step1.sql,
+-- supabase_salon_step2.sql и supabase_salon_step3.sql: они дополняют её,
+-- ничего не удаляя.
 
 -- --- Услуги ---
 -- Таблица называется products с прежних времён, когда бот вёл ещё и магазин.
@@ -53,14 +54,22 @@ create table if not exists appointments (
   -- рядом: по нему читают расписание, а ссылка держит запись за человеком, даже
   -- если владелец потом поправит написание имени.
   master_id bigint,
+  -- Когда клиенту напомнили о записи. Хранится в базе, а не в памяти бота:
+  -- сервис перезапускается по нескольку раз в сутки, и после каждого
+  -- перезапуска напоминания уходили бы заново.
+  reminded_at timestamptz,
   created_at timestamptz not null default now()
 );
 
 alter table appointments add column if not exists duration_minutes integer;
+alter table appointments add column if not exists reminded_at timestamptz;
 
 create index if not exists appointments_starts_at_idx on appointments (starts_at);
 create index if not exists appointments_status_idx on appointments (status, starts_at);
 create index if not exists appointments_phone_idx on appointments (phone);
+create index if not exists appointments_reminder_idx
+  on appointments (status, starts_at)
+  where reminded_at is null;
 
 alter table appointments disable row level security;
 
