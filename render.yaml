@@ -2,7 +2,7 @@ services:
   # WhatsApp-бот и Telegram-админка живут в одном сервисе (server.js): на free-тарифе
   # Render часы инстансов общие, двух круглосуточных сервисов не хватит.
   - type: web
-    name: shop-bots
+    name: salon-bots
     env: node
     plan: free
     buildCommand: npm install
@@ -15,7 +15,7 @@ services:
       - key: GROQ_MODEL
         value: llama-3.3-70b-versatile
       - key: GROQ_VISION_MODEL
-        value: meta-llama/llama-4-scout-17b-16e-instruct
+        value: qwen/qwen3.6-27b
       - key: GROQ_AUDIO_MODEL
         value: whisper-large-v3
 
@@ -28,13 +28,11 @@ services:
       - key: QR_TOKEN
         generateValue: true
 
-      # --- База товаров ---
+      # --- База (услуги и записи) ---
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
         sync: false
-      - key: LOW_STOCK_THRESHOLD
-        value: "5"
 
       # --- Telegram-админка ---
       - key: TELEGRAM_BOT_TOKEN
@@ -42,56 +40,36 @@ services:
       - key: ADMIN_TELEGRAM_IDS
         sync: false
 
-      # --- Магазин ---
-      - key: SHOP_MODE
-        value: "true"
-      - key: CURRENCY
-        value: сом
-
-      # --- Салон красоты ---
-      # Включите SALON_MODE вместо SHOP_MODE: бот начнёт записывать клиентов,
-      # а Telegram-админка превратится в журнал записей — записи, свободные
-      # окошки, расписание мастеров и кнопки отметки прихода. Склад при этом
-      # отключается целиком: услуга не товар, считать её штуками нечего.
-      # Требует таблицы appointments из supabase_schema.sql.
-      - key: SALON_MODE
-        value: "false"
+      # --- Салон ---
+      # Отдельного переключателя режима больше нет: бот всегда работает как салон.
+      # Требует таблиц из supabase_schema.sql и supabase_salon_step1.sql.
       - key: SALON_NAME
+        sync: false
+      - key: SALON_ADDRESS
+        sync: false
+      - key: SALON_PHONE
+        sync: false
+      - key: SALON_HOURS
         sync: false
       - key: SALON_TZ
         value: Asia/Bishkek
-      - key: SALON_HOURS
-        sync: false
       # Мастера через запятую (Айгуль,Динара). От них зависят выбор мастера при
       # записи и параллельность салона. Пусто — салон считается «в одно кресло».
       - key: SALON_MASTERS
         sync: false
+      # Длительность услуги по умолчанию и шаг сетки окошек — разные вещи:
+      # стрижка на 40 минут не должна занимать час.
       - key: SALON_SLOT_MINUTES
         value: "60"
+      - key: SALON_SLOT_STEP
+        value: "30"
       - key: SALON_LEAD_MINUTES
         value: "30"
 
-      # --- Режим «Торгаш»: бот торгуется с юмором, но цену не снижает ---
-      - key: HAGGLE_MODE
-        value: "false"
-      - key: HAGGLE_BADGES
-        value: "true"
-      - key: HAGGLE_NOTIFY_ROUND
-        value: "4"
-      - key: HAGGLE_BONUS
-        sync: false
-      - key: SHOP_NAME
-        sync: false
-      - key: SHOP_ADDRESS
-        sync: false
-      - key: SHOP_PHONE
-        sync: false
-      - key: SHOP_HOURS
-        sync: false
-      - key: SHOP_DELIVERY
-        sync: false
+      - key: CURRENCY
+        value: сом
       # Необязательные: если не заданы, бот соберёт тексты сам из данных выше.
-      - key: SHOP_SYSTEM_PROMPT
+      - key: SALON_SYSTEM_PROMPT
         sync: false
       - key: MANAGER_CONTACT_TEXT
         sync: false

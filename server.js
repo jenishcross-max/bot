@@ -57,10 +57,12 @@ const routes = {
       JSON.stringify({
         status: 'ok',
         whatsapp: getStatus().connection,
-        // Режимы и состояние админки видно снаружи: чаще всего «бот отвечает не
-        // так» — это незаполненная переменная на сервере, а не поломка в коде.
-        shopMode: process.env.SHOP_MODE === 'true',
-        salonMode: process.env.SALON_MODE === 'true',
+        // Состояние админки видно снаружи: чаще всего «бот отвечает не так» —
+        // это незаполненная переменная на сервере, а не поломка в коде.
+        salon: {
+          masters: require('./salon').MASTERS,
+          hours: require('./salon').workHoursText(),
+        },
         telegram: getAdminStatus(),
         startedAt: startedAt.toISOString(),
         uptimeSeconds: Math.round(process.uptime()),

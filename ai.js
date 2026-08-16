@@ -1,53 +1,33 @@
 const Groq = require('groq-sdk');
 const { notifyAdmins } = require('./notify');
-const haggle = require('./haggle');
-const { describeProductPhoto } = require('./stock-ai');
+const { describeClientPhoto } = require('./media-ai');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-// Режим магазина: подмешивает релевантные товары из Supabase в контекст ответа (RAG).
-const SHOP_MODE = process.env.SHOP_MODE === 'true';
-// Режим салона: то же самое плюс запись клиентов на время.
-const SALON_MODE = process.env.SALON_MODE === 'true';
-// Каталог нужен обоим: у магазина это товары, у салона — услуги с ценами.
-const CATALOG_MODE = SHOP_MODE || SALON_MODE;
 const {
-  searchProducts,
-  getProductNames,
+  searchServices,
+  getServiceNames,
+  findServiceByName,
   createAppointment,
   findClientAppointments,
   setAppointmentStatus,
   listAppointments,
-} = CATALOG_MODE ? require('./db') : {};
-const salon = SALON_MODE ? require('./salon') : null;
+} = require('./db');
+const salon = require('./salon');
 
-const SHOP_NAME = process.env.SHOP_NAME || 'магазин';
-const SHOP_ADDRESS = process.env.SHOP_ADDRESS || '';
-const SHOP_PHONE = process.env.SHOP_PHONE || '';
-const SHOP_HOURS = process.env.SHOP_HOURS || '';
-const SHOP_DELIVERY = process.env.SHOP_DELIVERY || '';
+// Данные салона. SHOP_* читаются запасным вариантом: они уже заполнены на
+// сервере, и заставлять владельца заводить их заново ради красивого имени
+// переменной — верный способ получить бота, забывшего свой адрес.
+const SALON_NAME = process.env.SALON_NAME || process.env.SHOP_NAME || 'салон';
+const SALON_ADDRESS = process.env.SALON_ADDRESS || process.env.SHOP_ADDRESS || '';
+const SALON_PHONE = process.env.SALON_PHONE || process.env.SHOP_PHONE || '';
+const SALON_HOURS_TEXT = process.env.SALON_HOURS || process.env.SHOP_HOURS || '';
 // Валюта в ответах клиентам. Меняется одной переменной — «тенге», «руб» и т.д.
 const CURRENCY = process.env.CURRENCY || 'сом';
 
-const DEFAULT_SHOP_PROMPT =
-  `Ты — вежливый продавец-консультант магазина «${SHOP_NAME}», отвечаешь клиентам в WhatsApp. ` +
-  'Отвечай кратко (2-4 предложения), на русском языке, дружелюбно и по делу. ' +
-  'Говори о наличии и ценах только по данным каталога, которые тебе передали. ' +
-  'Если товара нет — честно скажи об этом и предложи то, что есть. ' +
-  'Если клиент хочет оформить заказ, приехать или поговорить с человеком — скажи, ' +
-  'что передаёшь заявку менеджеру, и он свяжется с клиентом. ' +
-  // Описание фотографии подставляется в сообщение клиента автоматически.
-  // Без этой строчки бот отвечает «на фото я вижу...» и звучит как робот.
-  'Если в сообщении клиента есть пометка в квадратных скобках о присланном фото — ' +
-  'это автоматическое описание снимка. Отвечай по нему как продавец, посмотревший фото, ' +
-  'но саму пометку не пересказывай. Если по фото не понять, что за товар, — ' +
-  'спроси у клиента, а не выдумывай модель и размер.';
-
 // Салону продавать нечего — ему нужно занять время в кресле. Поэтому и роль
-// другая: администратор, который не столько консультирует, сколько записывает.
-const SALON_NAME = process.env.SALON_NAME || SHOP_NAME;
-
+// такая: администратор, который не столько консультирует, сколько записывает.
 const DEFAULT_SALON_PROMPT =
   `Ты — администратор салона красоты «${SALON_NAME}», отвечаешь клиентам в WhatsApp. ` +
   'Отвечай кратко (2-4 предложения), на русском языке, дружелюбно и по делу. ' +
@@ -64,41 +44,29 @@ const DEFAULT_SALON_PROMPT =
 // 100–500 КБ, но клиент может прислать и несжатый снимок файлом.
 const MAX_PHOTO_BYTES = 3.5 * 1024 * 1024;
 
-// У каждого режима своя роль, поэтому и промпт отдельный: так можно переключать
-// режимы одной переменной, не переписывая SYSTEM_PROMPT.
-function pickSystemPrompt() {
-  if (SALON_MODE) return process.env.SALON_SYSTEM_PROMPT || DEFAULT_SALON_PROMPT;
-  if (SHOP_MODE) return process.env.SHOP_SYSTEM_PROMPT || DEFAULT_SHOP_PROMPT;
-  return (
-    process.env.SYSTEM_PROMPT ||
-    'Ты — дружелюбный ассистент в WhatsApp. Отвечай кратко и по делу на русском языке.'
-  );
-}
+const SYSTEM_PROMPT = process.env.SALON_SYSTEM_PROMPT || DEFAULT_SALON_PROMPT;
 
-const SYSTEM_PROMPT = pickSystemPrompt();
-
-// Справка о магазине идёт отдельным системным сообщением: адрес и часы работы бот
+// Справка о салоне идёт отдельным системным сообщением: адрес и часы работы бот
 // иначе выдумывает, а так отвечает фактами владельца.
-function buildShopInfo() {
+function buildSalonInfo() {
   const lines = [];
-  if (SHOP_ADDRESS) lines.push(`Адрес: ${SHOP_ADDRESS}`);
-  if (SHOP_HOURS) lines.push(`Часы работы: ${SHOP_HOURS}`);
-  if (SHOP_PHONE) lines.push(`Телефон: ${SHOP_PHONE}`);
-  if (SHOP_DELIVERY) lines.push(`Доставка: ${SHOP_DELIVERY}`);
+  if (SALON_ADDRESS) lines.push(`Адрес: ${SALON_ADDRESS}`);
+  if (SALON_HOURS_TEXT) lines.push(`Часы работы: ${SALON_HOURS_TEXT}`);
+  if (SALON_PHONE) lines.push(`Телефон: ${SALON_PHONE}`);
+  if (salon.MASTERS.length > 0) lines.push(`Мастера: ${salon.MASTERS.join(', ')}`);
   if (lines.length === 0) return null;
-  const what = SALON_MODE ? 'о салоне' : 'о магазине';
-  return `Информация ${what} (отвечай по ней, ничего не добавляй от себя):\n${lines.join('\n')}`;
+  return `Информация о салоне (отвечай по ней, ничего не добавляй от себя):\n${lines.join('\n')}`;
 }
 
-const SHOP_INFO = buildShopInfo();
+const SALON_INFO = buildSalonInfo();
 
 function buildManagerText() {
   if (process.env.MANAGER_CONTACT_TEXT) return process.env.MANAGER_CONTACT_TEXT;
 
-  const lines = ['Конечно! Передал вашу заявку менеджеру — он свяжется с вами в ближайшее время.'];
-  if (SHOP_PHONE) lines.push(`Можете позвонить сами: ${SHOP_PHONE}`);
-  if (SHOP_ADDRESS) lines.push(`Наш адрес: ${SHOP_ADDRESS}`);
-  if (SHOP_HOURS) lines.push(`Работаем: ${SHOP_HOURS}`);
+  const lines = ['Конечно! Передала вашу просьбу администратору — он свяжется с вами в ближайшее время.'];
+  if (SALON_PHONE) lines.push(`Можете позвонить сами: ${SALON_PHONE}`);
+  if (SALON_ADDRESS) lines.push(`Наш адрес: ${SALON_ADDRESS}`);
+  if (SALON_HOURS_TEXT) lines.push(`Работаем: ${SALON_HOURS_TEXT}`);
   return lines.join('\n');
 }
 
@@ -136,15 +104,17 @@ function getHistory(chatId) {
   return conversations.get(chatId);
 }
 
-function formatProductsContext(products) {
-  if (!products || products.length === 0) {
-    return 'В каталоге сейчас нет подходящих товаров.';
+function formatServicesContext(services) {
+  if (!services || services.length === 0) {
+    return 'В прайсе салона пока нет подходящих услуг.';
   }
-  return products
-    .map((p) => {
-      const price = p.price != null ? `${p.price} ${CURRENCY}` : 'цена не указана';
-      const stock = typeof p.quantity === 'number' ? `, в наличии: ${p.quantity} шт.` : '';
-      return `- ${p.name}: ${price}${p.category ? ` [${p.category}]` : ''}${p.description ? ` — ${p.description}` : ''}${stock}`;
+  return services
+    .map((s) => {
+      const price = s.price != null ? `${s.price} ${CURRENCY}` : 'цена не указана';
+      // Длительность клиенту важна не меньше цены: «а сколько это по времени?» —
+      // второй вопрос после «сколько стоит».
+      const time = s.duration_minutes ? `, занимает ${s.duration_minutes} мин.` : '';
+      return `- ${s.name}: ${price}${time}${s.description ? ` — ${s.description}` : ''}`;
     })
     .join('\n');
 }
@@ -210,6 +180,10 @@ async function handleManagerRequest(chatId, userMessage, history, phone) {
 const PENDING_TTL_MS = 30 * 60 * 1000;
 const pendingBookings = new Map();
 
+// «Всё равно» в ответ на вопрос о мастере — это не имя, а разрешение выбрать
+// за клиента.
+const ANY_MASTER = /(любо(й|му|го)|вс[её] равно|без разницы|не важно|неважно|кто свободен|кому удобно|на ваше усмотрение)/i;
+
 function getPending(chatId) {
   const draft = pendingBookings.get(chatId);
   if (!draft) return null;
@@ -273,15 +247,28 @@ async function loadDay(day) {
   return listAppointments({ from, to, status: 'active', limit: 200 });
 }
 
-async function loadFreeSlots(day, now) {
-  return salon.freeSlots(day, await loadDay(day), { now });
+async function loadFreeSlots(day, now, duration) {
+  return salon.freeSlots(day, await loadDay(day), { now, duration });
+}
+
+// Сколько времени займёт названная услуга. Неизвестная услуга — обычное окошко:
+// отказывать клиенту из-за того, что он назвал стрижку своими словами, нельзя.
+async function serviceDuration(name) {
+  if (!name) return undefined;
+  try {
+    const found = await findServiceByName(name);
+    return found?.duration_minutes || undefined;
+  } catch (err) {
+    console.error('Не удалось узнать длительность услуги:', err.message);
+    return undefined;
+  }
 }
 
 // Кто свободен в конкретный момент. null — если база не ответила: молча
 // считать время свободным нельзя, тогда двое придут на один час.
-async function checkAvailability(when) {
+async function checkAvailability(when, duration) {
   try {
-    return salon.availabilityAt(when, await loadDay(when));
+    return salon.availabilityAt(when, await loadDay(when), { duration });
   } catch (err) {
     console.error('Не удалось проверить занятость времени:', err.message);
     return null;
@@ -289,14 +276,16 @@ async function checkAvailability(when) {
 }
 
 // Короткая строка «11:00, 13:00, 16:00» для подсказки внутри другого ответа.
-async function freeTimesText(day, { master, limit = 4 } = {}) {
+async function freeTimesText(day, { master, limit = 4, duration } = {}) {
   try {
-    let slots = await loadFreeSlots(day, new Date());
+    let slots = await loadFreeSlots(day, new Date(), duration);
     if (master) {
       slots = slots.filter((s) => s.masters.length === 0 || s.masters.includes(master));
     }
     if (slots.length === 0) return null;
-    return slots.slice(0, limit).map((s) => salon.formatTime(s.at)).join(', ');
+    // Вразброс по дню, а не первые подряд: «11:00, 13:00, 15:00, 17:00» —
+    // это выбор, а «09:00, 09:30, 10:00, 10:30» — только начало дня.
+    return salon.spreadSlots(slots, limit).map((s) => salon.formatTime(s.at)).join(', ');
   } catch (err) {
     console.error('Не удалось посчитать свободные окошки:', err.message);
     return null;
@@ -328,13 +317,16 @@ async function handleSlots(day) {
     const closed = salon
       .daySlots(asked)
       .every((at) => at.getTime() < now.getTime() + salon.LEAD_MINUTES * 60 * 1000);
-    const lines = salon.slotLines(slots);
+    const lines = salon.slotLines(slots, { limit: 6, spread: true });
     const head =
       i === 0
         ? `Свободно ${salon.dayLabel(target, now)}:`
         : `${cap(salon.dayLabel(asked, now))} ${closed ? 'мы уже закрываемся' : 'всё занято'}. ` +
           `Ближайшее свободное — ${salon.dayLabel(target, now)}:`;
-    const more = slots.length > lines.length ? '\nЕсть время и позже — скажите, когда удобно.' : '';
+    // Список теперь растянут на весь день, поэтому «есть время и позже» звучало
+    // бы странно: позже — это уже показано. Свободного больше, чем в списке,
+    // и сказать об этом всё равно стоит.
+    const more = slots.length > lines.length ? '\nЕсть и другое время — скажите, когда удобно.' : '';
 
     return `${head}\n${lines.map((l) => `• ${l}`).join('\n')}${more}\n\nНапишите время — запишу вас.`;
   }
@@ -377,7 +369,7 @@ async function handleBooking(chatId, userMessage, history, phone) {
 
   let services = [];
   try {
-    services = await getProductNames();
+    services = await getServiceNames();
   } catch (err) {
     console.error('Не удалось получить список услуг:', err.message);
   }
@@ -412,7 +404,19 @@ async function handleBooking(chatId, userMessage, history, phone) {
     when: parsed.when || pending?.when || null,
     day: parsed.day || pending?.day || null,
     note: parsed.note || pending?.note || null,
+    anyMaster: pending?.anyMaster || false,
   };
+
+  // Ответ на вопрос «к кому вас записать?». Короткое «к Динаре» разборщик
+  // записью не считает — имя мастера ищем в сообщении сами.
+  if (pending?.askedMaster) {
+    if (ANY_MASTER.test(userMessage)) draft.anyMaster = true;
+    else draft.master = draft.master || salon.matchMaster(userMessage);
+  }
+
+  // Длительность услуги решает всё дальнейшее: и какие окошки свободны, и
+  // успеет ли мастер закончить до закрытия.
+  const duration = await serviceDuration(draft.service);
 
   if (!draft.when) {
     savePending(chatId, draft);
@@ -420,18 +424,18 @@ async function handleBooking(chatId, userMessage, history, phone) {
     // начинается с нуля и это раздражает. И сразу показываем, что свободно:
     // выбрать из четырёх вариантов проще, чем угадывать время самому.
     if (draft.day) {
-      const free = await freeTimesText(draft.day, { master: draft.master });
+      const free = await freeTimesText(draft.day, { master: draft.master, duration });
       return free
         ? `Записываю на ${salon.formatDay(draft.day)}. Свободно: ${free}. Во сколько вам удобно?`
         : `Записываю на ${salon.formatDay(draft.day)}. Во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
     }
-    const today = await freeTimesText(new Date());
+    const today = await freeTimesText(new Date(), { duration });
     return today
       ? `Конечно, запишу вас! Сегодня свободно: ${today}. На какой день и время вам удобно?`
       : `Конечно, запишу вас! Работаем ${salon.workHoursText()}. На какой день и время вам удобно?`;
   }
 
-  const check = salon.checkWhen(draft.when);
+  const check = salon.checkWhen(draft.when, new Date(), { duration });
   if (!check.ok) {
     // Время уже прошло или салон закрыт — записать нельзя, но и терять клиента
     // нельзя: спрашиваем другое время, а не отвечаем «не могу».
@@ -440,10 +444,18 @@ async function handleBooking(chatId, userMessage, history, phone) {
       return `Хорошо! А во сколько вам удобно? Работаем ${salon.workHoursText()}.`;
     }
     if (check.reason === 'closed') {
-      const free = await freeTimesText(draft.when, { master: draft.master });
+      const free = await freeTimesText(draft.when, { master: draft.master, duration });
       return free
         ? `В это время мы уже закрыты — работаем ${salon.workHoursText()}. ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
         : `В это время мы уже закрыты — работаем ${salon.workHoursText()}. Подберём другое время?`;
+    }
+    // Начать успеваем, а закончить нет: услуга длинная, а до закрытия близко.
+    if (check.reason === 'no_time_left') {
+      const free = await freeTimesText(draft.when, { master: draft.master, duration });
+      const what = draft.service ? `на «${draft.service}»` : 'на эту услугу';
+      return free
+        ? `До закрытия не успеем ${what} — работаем ${salon.workHoursText()}. ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
+        : `До закрытия не успеем ${what} — работаем ${salon.workHoursText()}. Давайте подберём другой день?`;
     }
     if (check.reason === 'past') {
       return 'Это время уже прошло. На какой ближайший день вас записать?';
@@ -454,7 +466,7 @@ async function handleBooking(chatId, userMessage, history, phone) {
   // Занятость проверяем до вопроса об имени. В обратном порядке разговор выходит
   // издевательский: бот спрашивает «как вас записать?», клиент представляется —
   // и только тогда узнаёт, что это время занято.
-  const avail = await checkAvailability(draft.when);
+  const avail = await checkAvailability(draft.when, duration);
   const masterBusy = Boolean(
     avail && draft.master && salon.MASTERS.length > 0 && !avail.masters.includes(draft.master)
   );
@@ -473,11 +485,26 @@ async function handleBooking(chatId, userMessage, history, phone) {
     savePending(chatId, { ...draft, when: null });
     // «Занято, напишите другое время» — это работа, переложенная на клиента.
     // Сразу называем свободные часы того же дня: так он выбирает, а не гадает.
-    const free = await freeTimesText(draft.when, { master: draft.master });
+    const free = await freeTimesText(draft.when, { master: draft.master, duration });
     const head = draft.master ? `Это время уже занято (мастер: ${draft.master}).` : 'Это время уже занято.';
     return free
       ? `${head} ${cap(salon.dayLabel(draft.when))} свободно: ${free}. Какое подходит?`
       : `${head} На этот день свободных окошек не осталось. На какой другой день вас записать?`;
+  }
+
+  // К кому записать — спрашиваем только здесь и только один раз. Раньше времени
+  // этот вопрос задавать бессмысленно: пока час не выбран, неизвестно, кто в
+  // этот час вообще свободен. А если свободен один — вопроса не будет вовсе.
+  const freeMasters = avail ? avail.masters : [];
+  if (salon.MASTERS.length > 0 && !draft.master && !draft.anyMaster && freeMasters.length > 1) {
+    savePending(chatId, { ...draft, askedMaster: true });
+    return (
+      `${cap(salon.formatWhen(draft.when))} свободны: ${freeMasters.join(', ')}. ` +
+      'К кому вас записать? Можно ответить «всё равно» — посажу к свободному.'
+    );
+  }
+  if (salon.MASTERS.length > 0 && !draft.master && freeMasters.length > 0) {
+    draft.master = freeMasters[0];
   }
 
   if (!draft.clientName) {
@@ -493,6 +520,7 @@ async function handleBooking(chatId, userMessage, history, phone) {
       service: draft.service,
       master: draft.master,
       startsAt: draft.when,
+      durationMinutes: duration,
       source: 'whatsapp',
       note: draft.note,
     });
@@ -501,7 +529,7 @@ async function handleBooking(chatId, userMessage, history, phone) {
     notifyOwnerAboutBooking(appointment, phone);
 
     const lines = [`Готово, ${draft.clientName}! Записала вас: ${bookingSummary(appointment)}.`];
-    if (SHOP_ADDRESS) lines.push(`Адрес: ${SHOP_ADDRESS}`);
+    if (SALON_ADDRESS) lines.push(`Адрес: ${SALON_ADDRESS}`);
     lines.push('Если планы поменяются — напишите, перенесём.');
     return lines.join('\n');
   } catch (err) {
@@ -535,7 +563,7 @@ async function describePhoto(photo, caption) {
   }
 
   try {
-    return await describeProductPhoto(photo.data.toString('base64'), photo.mimeType, caption);
+    return await describeClientPhoto(photo.data.toString('base64'), photo.mimeType, caption);
   } catch (err) {
     console.error('Не удалось распознать фото клиента:', err.message);
     return null;
@@ -558,98 +586,65 @@ async function getAIReply(chatId, userMessage, { phone, photo } = {}) {
   history.push({ role: 'user', content: entry });
 
   // Запись проверяем раньше просьбы позвать человека: «приеду в три» — это про
-  // время, а не про менеджера, но в MANAGER_INTENT такие слова тоже попадают.
-  if (SALON_MODE) {
-    const booking = await handleBooking(chatId, userMessage, history, phone);
-    if (booking) {
-      history.push({ role: 'assistant', content: booking });
-      return booking;
-    }
+  // время, а не про администратора, но в MANAGER_INTENT такие слова тоже попадают.
+  const booking = await handleBooking(chatId, userMessage, history, phone);
+  if (booking) {
+    history.push({ role: 'assistant', content: booking });
+    return booking;
   }
 
   // В заявку владельцу уходит entry, а не userMessage: если клиент прислал
   // только фото без подписи, в уведомлении иначе будет пустая строка вместо
-  // «на фото такая-то футболка».
-  if (CATALOG_MODE && MANAGER_INTENT.test(userMessage)) {
+  // «на фото такая-то стрижка».
+  if (MANAGER_INTENT.test(userMessage)) {
     return handleManagerRequest(chatId, entry, history, phone);
   }
 
-  // Проверку на менеджера оставляем выше: «беру, оформляйте» после торга — это
-  // заявка, и владелец должен получить её, а не очередную шутку про ценник.
-  const haggling = haggle.detect(chatId, userMessage);
-
   const systemMessages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
-  if (CATALOG_MODE) {
-    if (SHOP_INFO) {
-      systemMessages.push({ role: 'system', content: SHOP_INFO });
-    }
-    try {
-      // По фото ищем словами, которые подобрала модель зрения: подпись вроде
-      // «есть такая?» для поиска бесполезна, а «футболка оверсайз белая» — нет.
-      const products = await searchProducts((seen && seen.query) || userMessage);
-      systemMessages.push({
-        role: 'system',
-        content:
-          'Вот товары из каталога магазина, релевантные запросу клиента. Используй только эти данные, ' +
-          'ничего не выдумывай про товары, которых здесь нет:\n' + formatProductsContext(products),
-      });
-    } catch (err) {
-      console.error('Не удалось получить товары из базы:', err);
-    }
+  if (SALON_INFO) {
+    systemMessages.push({ role: 'system', content: SALON_INFO });
   }
-
-  // Персона торгаша идёт последней системной инструкцией: поставленная раньше,
-  // она проигрывает промпту каталога («отвечай кратко и по делу»), и вместо шутки
-  // клиент получает сухое «цену снизить не могу».
-  if (haggling) systemMessages.push({ role: 'system', content: haggling.prompt });
+  try {
+    // По фото ищем словами, которые подобрала модель зрения: подпись вроде
+    // «а так сможете?» для поиска бесполезна, а «окрашивание блонд» — нет.
+    const services = await searchServices((seen && seen.query) || userMessage);
+    systemMessages.push({
+      role: 'system',
+      content:
+        'Вот услуги салона, подходящие под вопрос клиента. Отвечай только по этим данным, ' +
+        'ничего не выдумывай про услуги, которых здесь нет:\n' + formatServicesContext(services),
+    });
+  } catch (err) {
+    console.error('Не удалось получить услуги из базы:', err);
+  }
 
   const messages = [
     ...systemMessages,
     ...history.slice(-MAX_HISTORY_MESSAGES),
   ];
 
-  let completion;
-  try {
-    completion = await groq.chat.completions.create({
-      model: MODEL,
-      messages,
-      // Торгашу нужна отсебятина: на 0.7 шутки быстро начинают повторяться.
-      temperature: haggling ? 0.95 : 0.7,
-      max_tokens: 800,
-    });
-  } catch (err) {
-    // В торге молчание хуже заготовки: клиент ждёт ответной шутки, а не тишины.
-    if (!haggling) throw err;
-    console.error('Groq недоступен, отвечаю заготовкой торгаша:', err.message);
-    const canned = haggle.fallback(haggling);
-    history.push({ role: 'assistant', content: canned });
-    return canned + haggle.badge(haggling);
-  }
+  const completion = await groq.chat.completions.create({
+    model: MODEL,
+    messages,
+    temperature: 0.7,
+    max_tokens: 800,
+  });
 
-  let reply = completion.choices[0]?.message?.content?.trim() || 'Извините, не смог сформировать ответ.';
-
-  if (haggling) {
-    // Последний рубеж: что бы модель ни насочиняла, скидка до клиента не доедет.
-    reply = haggle.guard(reply, haggling);
-  }
+  const reply = completion.choices[0]?.message?.content?.trim() || 'Извините, не смогла сформировать ответ.';
 
   // Бот пообещал клиенту передать заявку — значит, владелец обязан её получить,
-  // даже если вопрос не попал в MANAGER_INTENT. Проверяем после guard: до него
-  // текст ответа ещё может измениться.
-  if (CATALOG_MODE && MANAGER_PROMISE.test(reply)) {
+  // даже если вопрос не попал в MANAGER_INTENT.
+  if (MANAGER_PROMISE.test(reply)) {
     notifyManager(chatId, entry, history, phone);
   }
 
   history.push({ role: 'assistant', content: reply });
-
-  // Игровую строчку в историю не кладём — модели она только мешает.
-  return haggling ? reply + haggle.badge(haggling) : reply;
+  return reply;
 }
 
 function resetHistory(chatId) {
   conversations.delete(chatId);
-  haggle.reset(chatId);
   lastNotifiedAt.delete(chatId);
   pendingBookings.delete(chatId);
 }

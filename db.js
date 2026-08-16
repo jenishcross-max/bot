@@ -1,23 +1,39 @@
+// База салона: услуги с ценами и записи клиентов.
+//
+// Услуги живут в таблице products — имя досталось от прежней версии бота, и
+// переименовывать таблицу с живыми данными ради красоты мы не стали. Колонки
+// склада (quantity, in_stock, category, photo_url) в ней ещё есть, но код их
+// больше не трогает: у услуги нет остатка, и «стрижка, 1 шт.» — бессмыслица,
+// из-за которой всё это и переделывалось.
 const { createClient } = require('@supabase/supabase-js');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-const LOW_STOCK_THRESHOLD = Number(process.env.LOW_STOCK_THRESHOLD || 5);
+/* ---------------- услуги ---------------- */
 
-async function addProduct({ name, price, description, photoUrl, category, quantity, inStock }) {
-  const qty = Math.max(0, Number(quantity) || 0);
+// Длительность услуги в минутах. Пусто — значит «как обычно», это решает salon.js.
+function cleanDuration(minutes) {
+  const n = Number(minutes);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.round(n), 12 * 60) : null;
+}
+
+function cleanPrice(price) {
+  if (price === undefined || price === null || price === '') return null;
+  const n = Number(price);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function addService({ name, price, description, durationMinutes }) {
   const { data, error } = await supabase
     .from('products')
     .insert({
       name,
-      price,
-      description,
-      photo_url: photoUrl,
-      category,
-      quantity: qty,
-      // У услуги остатка нет, а «нет в наличии» скрыло бы её от клиента: поиск
-      // по каталогу отдаёт только in_stock. Поэтому наличие можно задать явно.
-      in_stock: inStock === undefined ? qty > 0 : Boolean(inStock),
+      price: cleanPrice(price),
+      description: description || null,
+      duration_minutes: cleanDuration(durationMinutes),
+      // in_stock клиенту больше ничего не решает, но старые строки могли лечь с
+      // false — ставим true, чтобы услуга не осталась невидимой в чужом коде.
+      in_stock: true,
     })
     .select()
     .single();
@@ -26,7 +42,7 @@ async function addProduct({ name, price, description, photoUrl, category, quanti
   return data;
 }
 
-async function listProducts({ limit = 50 } = {}) {
+async function listServices({ limit = 50 } = {}) {
   const { data, error } = await supabase
     .from('products')
     .select('*')
@@ -37,82 +53,74 @@ async function listProducts({ limit = 50 } = {}) {
   return data;
 }
 
-async function deleteProduct(id) {
+async function deleteService(id) {
   const { error } = await supabase.from('products').delete().eq('id', id);
   if (error) throw error;
 }
 
-async function getProduct(id) {
+async function getService(id) {
   const { data, error } = await supabase.from('products').select('*').eq('id', id).single();
   if (error) throw error;
   return data;
 }
 
-// Возвращает названия товаров — используется как подсказка каталога для ИИ-парсера.
-async function getProductNames() {
+// Названия услуг — подсказка каталога для разборщика фраз.
+async function getServiceNames() {
   const { data, error } = await supabase.from('products').select('name').order('name');
   if (error) throw error;
-  return data.map((p) => p.name);
+  return data.map((s) => s.name);
 }
 
 // Экранируем спецсимволы PostgREST-фильтров (,()) и ILIKE-wildcards (%_), чтобы
-// пользовательский текст нельзя было использовать для инъекции в запрос.
+// текст клиента нельзя было использовать для инъекции в запрос.
 function sanitizeForIlike(text) {
   return text.replace(/[,()%_]/g, '\\$&');
 }
 
-// Слова, по которым искать бессмысленно — они есть почти в любом вопросе клиента.
+// Слова, которые есть почти в любом вопросе клиента — искать по ним бессмысленно.
 const STOP_WORDS = new Set([
   'есть', 'сколько', 'какая', 'какие', 'какой', 'цена', 'цены', 'стоит', 'стоят',
-  'наличии', 'наличие', 'хочу', 'нужно', 'нужен', 'нужна', 'купить', 'заказать',
-  'здравствуйте', 'привет', 'подскажите', 'пожалуйста', 'товар', 'товары', 'магазин',
+  'хочу', 'нужно', 'нужен', 'нужна', 'записаться', 'запись', 'записать',
+  'здравствуйте', 'привет', 'подскажите', 'пожалуйста', 'услуга', 'услуги', 'салон',
 ]);
 
-// Поиск по ключевым словам вопроса. Клиент пишет фразой («а сухарики есть?»), поэтому
-// ищем по каждому значимому слову отдельно и по его основе — иначе ILIKE по всей фразе
-// никогда не совпадёт с названием товара.
-async function searchProducts(query, { limit = 8 } = {}) {
-  const inStockCatalog = async () => {
-    const { data, error } = await supabase
-      .from('products')
-      .select('*')
-      .eq('in_stock', true)
-      .limit(limit);
+// Поиск по ключевым словам вопроса. Клиент пишет фразой («а окрашивание делаете?»),
+// поэтому ищем по каждому значимому слову отдельно и по его основе — ILIKE по всей
+// фразе не совпадёт с названием услуги никогда.
+async function searchServices(query, { limit = 8 } = {}) {
+  const wholePriceList = async () => {
+    const { data, error } = await supabase.from('products').select('*').limit(limit);
     if (error) throw error;
     return data;
   };
 
-  if (!query || !query.trim()) return inStockCatalog();
+  if (!query || !query.trim()) return wholePriceList();
 
   const words = query
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((w) => w.length >= 4 && !STOP_WORDS.has(w));
 
-  if (words.length === 0) return inStockCatalog();
+  if (words.length === 0) return wholePriceList();
 
   const patterns = new Set();
   for (const word of words) {
     patterns.add(word);
-    // Основа слова — «сухариков» должно находить «сухарики».
+    // Основа слова: «окрашивания» должно находить «окрашивание».
     if (word.length >= 6) patterns.add(word.slice(0, word.length - 2));
   }
 
   const filter = [...patterns]
     .map((p) => sanitizeForIlike(p))
-    .flatMap((p) => [`name.ilike.%${p}%`, `description.ilike.%${p}%`, `category.ilike.%${p}%`])
+    .flatMap((p) => [`name.ilike.%${p}%`, `description.ilike.%${p}%`])
     .join(',');
 
-  const { data, error } = await supabase
-    .from('products')
-    .select('*')
-    .or(filter)
-    .eq('in_stock', true)
-    .limit(limit);
+  const { data, error } = await supabase.from('products').select('*').or(filter).limit(limit);
 
   if (error) throw error;
-  // Ничего не нашли — отдаём каталог, чтобы бот мог предложить альтернативу вместо «не знаю».
-  return data.length > 0 ? data : inStockCatalog();
+  // Ничего не нашли — отдаём прайс целиком: пусть бот предложит, что есть,
+  // вместо «не знаю».
+  return data.length > 0 ? data : wholePriceList();
 }
 
 async function findByIlike(pattern) {
@@ -125,20 +133,17 @@ async function findByIlike(pattern) {
   return data?.[0] || null;
 }
 
-// Находит товар по имени. Кроме точного вхождения пробует основу слова, чтобы
-// «ватрушек»/«ватрушками» находили товар «Ватрушки» — русские окончания меняются,
-// а полноценной морфологии здесь не нужно.
-async function findProductByName(name) {
+// Услуга по названию из живой речи: «на окрашивание» -> «Окрашивание».
+// Нужна ради длительности — записать клиента на три часа можно, только зная,
+// что он назвал именно окраску.
+async function findServiceByName(name) {
   const trimmed = (name || '').trim();
   if (!trimmed) return null;
 
   const direct = await findByIlike(`%${sanitizeForIlike(trimmed)}%`);
   if (direct) return direct;
 
-  // Берём самое длинное слово — оно обычно и есть название товара.
-  const longestWord = trimmed
-    .split(/\s+/)
-    .sort((a, b) => b.length - a.length)[0];
+  const longestWord = trimmed.split(/\s+/).sort((a, b) => b.length - a.length)[0];
   if (!longestWord || longestWord.length < 5) return null;
 
   // Отсекаем до трёх последних символов, пока не найдём совпадение по основе.
@@ -152,7 +157,7 @@ async function findProductByName(name) {
   return null;
 }
 
-async function updateProductById(id, patch) {
+async function updateServiceById(id, patch) {
   const { data, error } = await supabase
     .from('products')
     .update(patch)
@@ -163,149 +168,31 @@ async function updateProductById(id, patch) {
   return data;
 }
 
-// Возвращает товар к состоянию из снимка (используется кнопкой «Отменить»).
-async function restoreProduct(snapshot) {
-  return updateProductById(snapshot.id, {
-    name: snapshot.name,
-    price: snapshot.price,
-    quantity: snapshot.quantity,
-    in_stock: snapshot.in_stock,
-  });
-}
-
-// Краткая сводка по складу: сколько товаров, суммарный остаток, что заканчивается.
-async function getStockSummary() {
-  const { data, error } = await supabase
-    .from('products')
-    .select('name, quantity, in_stock, price')
-    .order('name', { ascending: true });
-  if (error) throw error;
-
-  const totalProducts = data.length;
-  const totalUnits = data.reduce((sum, p) => sum + (p.quantity || 0), 0);
-  const totalValue = data.reduce((sum, p) => sum + (p.quantity || 0) * (Number(p.price) || 0), 0);
-  const outOfStock = data.filter((p) => !p.in_stock || (p.quantity || 0) === 0);
-  const lowStock = data.filter(
-    (p) => (p.quantity || 0) > 0 && (p.quantity || 0) <= LOW_STOCK_THRESHOLD
-  );
-
-  return { totalProducts, totalUnits, totalValue, outOfStock, lowStock, products: data };
-}
-
-// Применяет одно действие от ИИ-парсера. Возвращает результат и снимок «до» —
-// он нужен, чтобы пользователь мог откатить неверно распознанное изменение.
-async function applyStockAction(action) {
-  const { type, name, quantity } = action;
-  const existing = await findProductByName(name);
-
-  if (type === 'query') {
-    return { action: existing ? 'query' : 'not_found', product: existing, name };
-  }
-
-  if (type === 'delete') {
-    if (!existing) return { action: 'not_found', name };
-    await deleteProduct(existing.id);
-    return { action: 'deleted', product: existing, before: existing };
-  }
-
-  if (type === 'update') {
-    if (!existing) return { action: 'not_found', name };
-
-    const patch = {};
-    if (action.new_name) patch.name = action.new_name;
-    if (action.price !== undefined && action.price !== null && !Number.isNaN(Number(action.price))) {
-      patch.price = Number(action.price);
-    }
-    if (
-      action.set_quantity !== undefined &&
-      action.set_quantity !== null &&
-      !Number.isNaN(Number(action.set_quantity))
-    ) {
-      patch.quantity = Math.max(0, Number(action.set_quantity));
-      patch.in_stock = patch.quantity > 0;
-    }
-    if (Object.keys(patch).length === 0) return { action: 'ignored', name };
-
-    const updated = await updateProductById(existing.id, patch);
-    return { action: 'updated', product: updated, before: existing };
-  }
-
-  if (type === 'restock') {
-    const addQty = Math.max(0, Number(quantity) || 0);
-    if (existing) {
-      const newQty = (existing.quantity || 0) + addQty;
-      const patch = { quantity: newQty, in_stock: newQty > 0 };
-      if (action.price !== undefined && action.price !== null && !Number.isNaN(Number(action.price))) {
-        patch.price = Number(action.price);
-      }
-      const updated = await updateProductById(existing.id, patch);
-      return { action: 'updated', product: updated, before: existing };
-    }
-    const created = await addProduct({ name, quantity: addQty, price: action.price ?? null });
-    return { action: 'created', product: created };
-  }
-
-  if (type === 'sale') {
-    if (!existing) return { action: 'not_found', name };
-    const subQty = Math.max(0, Number(quantity) || 0);
-    const newQty = Math.max(0, (existing.quantity || 0) - subQty);
-    const updated = await updateProductById(existing.id, { quantity: newQty, in_stock: newQty > 0 });
-    return { action: 'updated', product: updated, before: existing };
-  }
-
-  if (type === 'out_of_stock') {
-    if (!existing) return { action: 'not_found', name };
-    const updated = await updateProductById(existing.id, { quantity: 0, in_stock: false });
-    return { action: 'updated', product: updated, before: existing };
-  }
-
-  return { action: 'ignored', name };
-}
-
-/* ---------------- услуги салона ----------------
-   Лежат в той же таблице products. Отличие от товара одно: остатка у услуги нет,
-   но клиенту она видна всегда. */
-
-// Добавляет услугу или обновляет цену существующей. Совпадение ищем точное (без
-// учёта регистра), а не по основе слова: «стрижка» и «стрижка детская» — разные
+// Добавляет услугу или правит существующую. Совпадение ищем точное (без учёта
+// регистра), а не по основе слова: «стрижка» и «стрижка детская» — разные
 // услуги, и цену второй нельзя записывать в первую.
-async function saveService({ name, price }) {
+async function saveService({ name, price, durationMinutes }) {
   const clean = String(name || '').trim();
   if (!clean) throw new Error('Не указано название услуги');
 
   const existing = await findByIlike(sanitizeForIlike(clean));
   if (existing) {
     const patch = { in_stock: true };
-    if (price !== undefined && price !== null && !Number.isNaN(Number(price))) {
-      patch.price = Number(price);
-    }
-    const updated = await updateProductById(existing.id, patch);
+    if (cleanPrice(price) !== null) patch.price = cleanPrice(price);
+    if (cleanDuration(durationMinutes) !== null) patch.duration_minutes = cleanDuration(durationMinutes);
+    const updated = await updateServiceById(existing.id, patch);
     return { service: updated, created: false, before: existing };
   }
 
-  const created = await addProduct({ name: clean, price: price ?? null, quantity: 0, inStock: true });
+  const created = await addService({ name: clean, price, durationMinutes });
   return { service: created, created: true };
 }
 
-// Открывает клиентам услуги, скрытые пометкой «нет в наличии» — обычно это те,
-// что заводились когда-то как товар с нулевым остатком. Только для салона:
-// в магазине «нет в наличии» означает ровно то, что написано.
-async function publishServices() {
-  const { data, error } = await supabase
-    .from('products')
-    .update({ in_stock: true })
-    .eq('in_stock', false)
-    .select();
-  if (error) throw error;
-  return data;
-}
+/* ---------------- записи клиентов ---------------- */
 
-/* ---------------- записи клиентов (режим салона) ---------------- */
-
-// Активная запись — та, которую ещё не отменили и по которой клиент не пришёл.
-// Статусы держим строками, а не булевыми флагами: «отменена» и «пришёл» —
-// разные вещи, и владельцу в истории важно видеть, чем закончилось.
-const APPOINTMENT_STATUSES = ['active', 'done', 'cancelled'];
+// Статусы держим строками, а не булевыми флагами: «отменена», «пришёл» и «не
+// пришёл» — три разные вещи, и владельцу в истории важно, чем закончилось.
+const APPOINTMENT_STATUSES = ['active', 'done', 'cancelled', 'no_show'];
 
 async function createAppointment({
   clientName,
@@ -314,6 +201,7 @@ async function createAppointment({
   service,
   master,
   startsAt,
+  durationMinutes,
   source = 'whatsapp',
   note,
 }) {
@@ -326,6 +214,9 @@ async function createAppointment({
       service: service || null,
       master: master || null,
       starts_at: new Date(startsAt).toISOString(),
+      // Длительность записываем снимком: услуга подорожает и удлинится, а
+      // вчерашняя запись должна занимать столько, сколько занимала.
+      duration_minutes: cleanDuration(durationMinutes),
       status: 'active',
       source,
       note: note || null,
@@ -380,6 +271,25 @@ async function setAppointmentStatus(id, status) {
   return data;
 }
 
+// Перенос записи: меняется время, иногда заодно мастер. Отдельной функцией, а не
+// «отменить и создать заново», — иначе в истории клиента вместо одного визита
+// остаётся отменённая запись и загадочная новая.
+async function moveAppointment(id, { startsAt, master, durationMinutes }) {
+  const patch = {};
+  if (startsAt) patch.starts_at = new Date(startsAt).toISOString();
+  if (master !== undefined) patch.master = master || null;
+  if (durationMinutes !== undefined) patch.duration_minutes = cleanDuration(durationMinutes);
+
+  const { data, error } = await supabase
+    .from('appointments')
+    .update(patch)
+    .eq('id', id)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
 // Записи конкретного клиента — по номеру или по чату WhatsApp. Номер не всегда
 // известен (WhatsApp отдаёт LID), поэтому ищем по тому, что есть.
 async function findClientAppointments({ phone, chatId, status = 'active', limit = 10 }) {
@@ -398,22 +308,18 @@ async function findClientAppointments({ phone, chatId, status = 'active', limit 
 }
 
 module.exports = {
-  LOW_STOCK_THRESHOLD,
   createAppointment,
   listAppointments,
   getAppointment,
   setAppointmentStatus,
+  moveAppointment,
   findClientAppointments,
-  addProduct,
-  listProducts,
-  deleteProduct,
-  getProduct,
-  getProductNames,
+  addService,
+  listServices,
+  deleteService,
+  getService,
+  getServiceNames,
   saveService,
-  publishServices,
-  searchProducts,
-  findProductByName,
-  applyStockAction,
-  restoreProduct,
-  getStockSummary,
+  searchServices,
+  findServiceByName,
 };

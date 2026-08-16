@@ -1,12 +1,13 @@
-// Режим салона красоты / парикмахерской.
+// Салон красоты / парикмахерская: время, мастера и разбор просьбы записаться.
 //
-// Отличие от магазина одно, но оно меняет всё: клиенту не нужен товар, ему нужно
-// время. Поэтому здесь живёт то, чего нет в магазинной части, — работа с датами
-// («завтра в три» -> конкретный момент) и разбор просьбы записаться.
+// Клиенту здесь нужен не предмет, а час в кресле. Поэтому всё в этом файле про
+// время: «завтра в три» -> конкретный момент, сетка свободных окошек, занятость
+// мастера. Считает это один код на всех — и бота в WhatsApp, и админку в
+// Телеграме: разойдись два расчёта, владелец пообещает по телефону время,
+// которое бот в этот же момент отдал другому.
 //
-// Услуги салона лежат в той же таблице products, что и товары магазина: у услуги
-// есть название и цена, а остаток для неё всегда «есть». Заводить вторую таблицу
-// ради этого незачем — весь поиск по каталогу и админка работают как были.
+// Услуги лежат в таблице products (имя досталось от прежней версии): название,
+// цена и длительность.
 
 const Groq = require('groq-sdk');
 
@@ -16,7 +17,24 @@ const MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 // Часовой пояс салона. Сервер на Render живёт по UTC, а «сегодня в 14:00» клиент
 // говорит по своим часам: без пояса запись уезжает на шесть часов назад.
 const TIMEZONE = process.env.SALON_TZ || 'Asia/Bishkek';
+
+// Два разных числа, которые раньше были одним и тем же.
+//
+// SLOT_MINUTES — сколько длится услуга, у которой длительность не проставлена.
+// SLOT_STEP — как часто мы вообще предлагаем время: 09:00, 09:30, 10:00...
+//
+// Пока это было одно число, стрижка на сорок минут съедала час, а окраска на
+// три часа занимала один — и бот предлагал клиенту время, когда мастер ещё
+// работал с предыдущим.
 const SLOT_MINUTES = Number(process.env.SALON_SLOT_MINUTES || 60);
+const SLOT_STEP = Number(process.env.SALON_SLOT_STEP || 30);
+
+// Сколько занимает конкретная запись. У старых записей колонки нет вовсе —
+// считаем их обычными по длительности.
+function appointmentDuration(a) {
+  const raw = Number(a?.duration_minutes);
+  return Number.isFinite(raw) && raw > 0 ? raw : SLOT_MINUTES;
+}
 const MASTERS = (process.env.SALON_MASTERS || '')
   .split(',')
   .map((s) => s.trim())
@@ -267,11 +285,13 @@ function matchMaster(name, masters = MASTERS) {
    никто не проверял. Считаем их из расписания: сетка рабочего дня минус то,
    что уже занято. */
 
-// Сетка времени салона на конкретный день: 09:00, 10:00, ... до закрытия.
-// Последнее окошко должно успеть закончиться до закрытия, поэтому и «+ шаг».
-function daySlots(day) {
+// Сетка времени салона на конкретный день: 09:00, 09:30, 10:00 ... до закрытия.
+// duration — сколько займёт услуга, которую в это окошко хотят поставить: до
+// закрытия она должна успеть закончиться, поэтому окраска на три часа исчезает
+// из вечера сама собой, а стрижка на сорок минут в том же вечере остаётся.
+function daySlots(day, { duration = SLOT_MINUTES } = {}) {
   const out = [];
-  for (let m = WORK_HOURS.open; m + SLOT_MINUTES <= WORK_HOURS.close; m += SLOT_MINUTES) {
+  for (let m = WORK_HOURS.open; m + duration <= WORK_HOURS.close; m += SLOT_STEP) {
     const at = atLocalTime(day, m);
     if (at) out.push(at);
   }
@@ -286,10 +306,17 @@ function daySlots(day) {
 // и любая запись занимает время целиком. Если мастера есть, занятым считается
 // не время, а конкретный мастер: салон в четыре руки работает параллельно, и
 // «занято» для всего салона отдало бы второму клиенту отказ на пустом месте.
-function availabilityAt(when, busy = [], { masters = MASTERS } = {}) {
-  const windowMs = SLOT_MINUTES * 60 * 1000;
-  const at = new Date(when).getTime();
-  const taken = busy.filter((a) => Math.abs(new Date(a.starts_at).getTime() - at) < windowMs);
+function availabilityAt(when, busy = [], { masters = MASTERS, duration = SLOT_MINUTES } = {}) {
+  const start = new Date(when).getTime();
+  const end = start + duration * 60 * 1000;
+
+  // Пересечение двух отрезков, а не «сколько минут между началами»: запись на
+  // окраску с 12:00 занимает и 13:00, и 14:00, хотя начинается один раз.
+  const taken = busy.filter((a) => {
+    const from = new Date(a.starts_at).getTime();
+    const to = from + appointmentDuration(a) * 60 * 1000;
+    return from < end && to > start;
+  });
 
   if (masters.length === 0) {
     return { free: taken.length === 0, masters: [], taken };
@@ -306,12 +333,12 @@ function availabilityAt(when, busy = [], { masters = MASTERS } = {}) {
 }
 
 // Свободное время дня — та же проверка, прогнанная по сетке рабочего дня.
-function freeSlots(day, busy = [], { now = new Date(), masters = MASTERS } = {}) {
+function freeSlots(day, busy = [], { now = new Date(), masters = MASTERS, duration = SLOT_MINUTES } = {}) {
   const notBefore = now.getTime() + LEAD_MINUTES * 60 * 1000;
 
-  return daySlots(day)
+  return daySlots(day, { duration })
     .filter((at) => at.getTime() >= notBefore)
-    .map((at) => ({ at, ...availabilityAt(at, busy, { masters }) }))
+    .map((at) => ({ at, ...availabilityAt(at, busy, { masters, duration }) }))
     .filter((s) => s.free);
 }
 
@@ -319,8 +346,20 @@ function freeSlots(day, busy = [], { now = new Date(), masters = MASTERS } = {})
 // «11:00 — Динара, Айгуль» рядом с «11:00» ничего не добавляет, а читать мешает.
 // Владельцу наоборот — ему важно видеть, кто именно свободен, поэтому в админке
 // вызываем с withMasters.
-function slotLines(slots, { masters = MASTERS, limit = 8, withMasters = false } = {}) {
-  return slots.slice(0, limit).map((s) => {
+// Несколько окошек, растянутых на весь день, вместо первых подряд. С шагом в
+// полчаса первые восемь окошек — это 09:00…12:30: клиент видит стену почти
+// одинаковых цифр и ни одного времени после обеда, хотя день свободен весь.
+function spreadSlots(slots, limit) {
+  if (slots.length <= limit) return slots;
+  const step = (slots.length - 1) / (limit - 1);
+  const picked = [];
+  for (let i = 0; i < limit; i += 1) picked.push(slots[Math.round(i * step)]);
+  return [...new Set(picked)];
+}
+
+function slotLines(slots, { masters = MASTERS, limit = 8, withMasters = false, spread = false } = {}) {
+  const shown = spread ? spreadSlots(slots, limit) : slots.slice(0, limit);
+  return shown.map((s) => {
     const time = formatTime(s.at);
     if (masters.length === 0) return time;
     if (!withMasters && s.masters.length === masters.length) return time;
@@ -335,7 +374,7 @@ const MAX_AHEAD_DAYS = 120;
 // Модель иногда возвращает правдоподобную чушь: прошлый год, три часа ночи,
 // дату через десять лет. Пускать такое в базу нельзя — записи не должно быть
 // вообще, чем должна быть неверная.
-function checkWhen(date, now = new Date()) {
+function checkWhen(date, now = new Date(), { duration = SLOT_MINUTES } = {}) {
   if (!date) return { ok: false, reason: 'no_time' };
   if (date.getTime() < now.getTime() - 60 * 1000) return { ok: false, reason: 'past' };
   if (date.getTime() > now.getTime() + MAX_AHEAD_DAYS * 24 * 60 * 60 * 1000) {
@@ -349,6 +388,11 @@ function checkWhen(date, now = new Date()) {
   if (minutes === 0) return { ok: false, reason: 'no_clock' };
   if (minutes < WORK_HOURS.open || minutes >= WORK_HOURS.close) {
     return { ok: false, reason: 'closed' };
+  }
+  // Начать до закрытия мало — надо успеть закончить. Окраска на три часа в
+  // 18:30 не «свободное окошко», а мастер, который уйдёт домой в девять.
+  if (minutes + duration > WORK_HOURS.close) {
+    return { ok: false, reason: 'no_time_left' };
   }
   return { ok: true };
 }
@@ -515,6 +559,8 @@ module.exports = {
   TIMEZONE,
   MASTERS,
   SLOT_MINUTES,
+  SLOT_STEP,
+  appointmentDuration,
   LEAD_MINUTES,
   WORK_HOURS,
   workHoursText,
@@ -536,6 +582,7 @@ module.exports = {
   daySlots,
   availabilityAt,
   freeSlots,
+  spreadSlots,
   slotLines,
   checkWhen,
   looksLikeBooking,

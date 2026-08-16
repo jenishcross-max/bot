@@ -88,6 +88,27 @@ async function downloadPhoto(sock, msg) {
 let reconnectDelay = 1000;
 const RECONNECT_DELAY_MAX = 30000;
 
+// Живое соединение с WhatsApp. Нужно наружу, чтобы админка могла написать
+// клиенту сама — например, что его запись перенесли. Пишем только тем, кто уже
+// переписывался с ботом: сообщение первым незнакомому номеру WhatsApp считает
+// спамом и блокирует номер салона.
+let liveSock = null;
+
+async function sendToClient(chatId, text) {
+  if (!chatId) return false;
+  if (!liveSock || status.connection !== 'open') {
+    console.error('WhatsApp не на связи — сообщение клиенту не отправлено.');
+    return false;
+  }
+  try {
+    await liveSock.sendMessage(chatId, { text });
+    return true;
+  } catch (err) {
+    console.error('Не удалось написать клиенту в WhatsApp:', err.message);
+    return false;
+  }
+}
+
 async function startBot() {
   loadSessionFromEnv();
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -99,6 +120,7 @@ async function startBot() {
     logger,
     printQRInTerminal: false,
   });
+  liveSock = sock;
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -192,4 +214,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { startBot, getStatus, resolveCustomerPhone, digitsFromJid };
+module.exports = { startBot, getStatus, sendToClient, resolveCustomerPhone, digitsFromJid };
